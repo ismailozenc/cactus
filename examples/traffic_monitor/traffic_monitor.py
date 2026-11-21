@@ -6,16 +6,20 @@ How it works
 1. A background thread reads the RTSP stream and keeps only the newest frame,
    so a slow model never builds up a delay behind live video.
 2. Each processed frame goes through Mirage (``sections=["objects", "text"]``).
-   Objects whose label looks like a vehicle are kept.
+   Objects whose label looks like a vehicle are kept, duplicate boxes of the
+   same vehicle are dropped, and "license plate" objects are matched to the
+   vehicle they sit on.
 3. A small IoU tracker links vehicle boxes across frames into tracks.
 4. Direction comes from how a track moves: towards the bottom of the frame
    and growing means approaching the camera, the reverse means leaving.
    ``APPROACH`` says which screen direction counts as "coming".
-5. Plates: text that Mirage reads inside a vehicle box is a candidate. For
-   vehicles without a confirmed plate, the vehicle is also cropped from the
+5. Plates: text that Mirage reads inside a vehicle box is a candidate, and
+   text inside its plate box counts double. For vehicles without a confirmed
+   plate, the plate box (or the whole vehicle) is also cropped from the
    full-resolution frame and read again, because Mirage downsizes its input
-   and plates are small. Candidates are cleaned, checked against
-   ``PLATE_REGEX`` and voted on across frames.
+   and plates are small. The camera's own on-screen text is ignored.
+   Candidates are cleaned, fitted to ``PLATE_FORMATS`` (or checked against
+   ``PLATE_REGEX``) and voted on across frames.
 6. When a track disappears, one row is written to ``traffic_output/events.csv``
    together with a snapshot of the vehicle.
 
@@ -57,14 +61,42 @@ DUMP_JSON_FRAMES = 3
 BBOX_ORDER = "xyxy"
 BBOX_SCALE = 1000.0
 
-# Object labels that count as vehicles (matched as substrings, lowercase).
+# Object labels that count as vehicles (whole words, lowercase). A label that
+# also names a part ("car door", "license plate") is not a vehicle.
 VEHICLE_WORDS = ("car", "truck", "bus", "van", "vehicle", "motorcycle", "motorbike",
                  "suv", "taxi", "pickup", "lorry", "jeep", "minivan")
+VEHICLE_PART_WORDS = ("plate", "wheel", "tire", "tyre", "door", "window", "mirror", "light",
+                      "headlight", "grille", "bumper", "seat", "hood", "roof", "logo", "badge")
 
-# Plate format after cleaning (uppercase letters and digits only). The default
-# accepts 4 to 9 characters with at least one digit and one letter. Tighten it
-# to your country's format, e.g. UK: r"^[A-Z]{2}[0-9]{2}[A-Z]{3}$",
-# Turkey: r"^[0-9]{2}[A-Z]{1,3}[0-9]{2,4}$".
+# A vehicle box lying mostly inside a bigger one, and not much smaller, is
+# a duplicate detection of the same vehicle and is dropped.
+DUPLICATE_OVERLAP = 0.8        # share of the smaller box inside the bigger one
+DUPLICATE_SIZE_RATIO = 0.4     # smaller/bigger area; tinier boxes are cars behind
+
+# Mirage also detects number plates as objects. Their boxes are preferred for
+# reading: text inside one gets PLATE_BOX_VOTES votes instead of 1, and the
+# crop pass reads the plate box instead of the whole vehicle.
+PLATE_WORDS = ("license plate", "licence plate", "number plate", "registration plate")
+PLATE_BOX_VOTES = 2
+PLATE_CROP_PAD = 0.25
+PLATE_CROP_MIN_WIDTH = 24      # pixels; smaller plate boxes fall back to the vehicle crop
+
+# Text that is never a plate, such as the camera's on-screen name. Compared
+# after cleaning (uppercase, letters and digits only).
+IGNORE_TEXT = ("CAMERA01",)
+# Text inside objects with these names is skipped (Mirage calls the camera's
+# on-screen text "watermark").
+IGNORE_TEXT_IN = ("watermark", "timestamp", "logo")
+
+# Plate layouts, A = letter and 9 = digit. When set, every read is fitted to
+# them position by position, so for UK ("AA99AAA",) the read BSLIZ6B becomes
+# BS11ZGB, and PLATE_REGEX is not used. Several layouts may be listed, e.g.
+# Turkey: ("99A9999", "99A99999", "99AA999", "99AA9999", "99AAA99", "99AAA999").
+PLATE_FORMATS = ()
+PLATE_MAX_FIXES = 3            # most characters a layout may correct in one read
+
+# Used when PLATE_FORMATS is empty: the plate after cleaning. The default
+# accepts 4 to 9 characters with at least one digit and one letter.
 PLATE_REGEX = r"^(?=.*[0-9])(?=.*[A-Z])[A-Z0-9]{4,9}$"
 PLATE_CONFIRM_VOTES = 3        # identical reads needed before a plate is final
 
@@ -255,8 +287,55 @@ def parse_text(result: dict, width: int, height: int):
     return found
 
 
+def _words(label: str):
+    return set(re.findall(r"[a-z]+", label.lower()))
+
+
+def _has_word(label: str, words) -> bool:
+    found = _words(label)
+    return any(w in found or w + "s" in found or w + "es" in found for w in words)
+
+
 def is_vehicle(label: str) -> bool:
-    return any(word in label for word in VEHICLE_WORDS)
+    return _has_word(label, VEHICLE_WORDS) and not _has_word(label, VEHICLE_PART_WORDS)
+
+
+def is_plate(label: str) -> bool:
+    return any(phrase in label.lower() for phrase in PLATE_WORDS)
+
+
+def is_ignored_region(label: str) -> bool:
+    return _has_word(label, IGNORE_TEXT_IN)
+
+
+def area(box) -> float:
+    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+
+def contains_point(box, x, y) -> bool:
+    return box[0] <= x <= box[2] and box[1] <= y <= box[3]
+
+
+def centre(box):
+    return (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+
+def drop_duplicates(detections):
+    """Remove vehicle boxes that are a second detection of a bigger box."""
+    kept = []
+    for det in sorted(detections, key=lambda d: area(d[2]), reverse=True):
+        box = det[2]
+        duplicate = False
+        for other in kept:
+            ob = other[2]
+            inter = area((max(box[0], ob[0]), max(box[1], ob[1]), min(box[2], ob[2]), min(box[3], ob[3])))
+            if (area(box) > 0 and inter / area(box) >= DUPLICATE_OVERLAP
+                    and area(box) / area(ob) >= DUPLICATE_SIZE_RATIO):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(det)
+    return kept
 
 
 # ------------------------------------------------------------------ plates --
@@ -265,17 +344,68 @@ _plate_re = re.compile(PLATE_REGEX)
 # Characters OCR commonly swaps; tried when a read does not fit the format.
 _AMBIGUOUS = {"O": "0", "0": "O", "I": "1", "1": "I", "S": "5", "5": "S",
               "B": "8", "8": "B", "Z": "2", "2": "Z", "G": "6", "6": "G"}
+# Position-aware fixes used with PLATE_FORMATS.
+_TO_DIGIT = {"O": "0", "Q": "0", "D": "0", "U": "0", "I": "1", "L": "1", "J": "1", "T": "1",
+             "Z": "2", "A": "4", "S": "5", "G": "6", "B": "8"}
+_TO_LETTER = {"0": "O", "1": "I", "2": "Z", "4": "A", "5": "S", "6": "G", "7": "T", "8": "B"}
 
 
 def clean_plate(text: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", text.upper())
 
 
+def fit_format(cleaned: str, layout: str):
+    """Fit cleaned to a layout such as AA99AAA. Returns (plate, fixes) or None."""
+    if len(cleaned) != len(layout):
+        return None
+    out, fixes = [], 0
+    for ch, want in zip(cleaned, layout.upper()):
+        if want == "A":
+            if ch.isalpha():
+                out.append(ch)
+            elif ch in _TO_LETTER:
+                out.append(_TO_LETTER[ch])
+                fixes += 1
+            else:
+                return None
+        elif want == "9":
+            if ch.isdigit():
+                out.append(ch)
+            elif ch in _TO_DIGIT:
+                out.append(_TO_DIGIT[ch])
+                fixes += 1
+            else:
+                return None
+        elif ch == want:
+            out.append(ch)
+        else:
+            return None
+    return "".join(out), fixes
+
+
+def _fit_formats(cleaned: str):
+    best = None
+    for layout in PLATE_FORMATS:
+        # Also try every window, so a stray border mark or a country band
+        # ("GB", "TR") before or after the plate does not spoil the read.
+        for start in range(0, len(cleaned) - len(layout) + 1):
+            fitted = fit_format(cleaned[start:start + len(layout)], layout)
+            if fitted is None or fitted[1] > PLATE_MAX_FIXES:
+                continue
+            extra = len(cleaned) - len(layout)
+            score = (fitted[1] + extra, -len(layout))
+            if best is None or score < best[0]:
+                best = (score, fitted[0])
+    return [best[1]] if best else []
+
+
 def plate_candidates(text: str):
     """Plates that text may contain, best guess first."""
     cleaned = clean_plate(text)
-    if not cleaned:
+    if not cleaned or cleaned in {clean_plate(t) for t in IGNORE_TEXT}:
         return []
+    if PLATE_FORMATS:
+        return _fit_formats(cleaned)
     if _plate_re.match(cleaned):
         return [cleaned]
     # Try fixing one ambiguous character at a time, but only for text that
@@ -311,6 +441,7 @@ class Track:
     missed: int = 0
     best_snapshot: object = None
     best_area: float = 0.0
+    plate_box: object = None   # plate Mirage found on this vehicle in the current frame
 
     @property
     def plate(self):
@@ -432,14 +563,19 @@ class EventLog:
         self._file.close()
 
 
-def crop(frame, box, pad: float):
+def crop_region(frame, box, pad: float):
+    """Return (piece, (x0, y0)): box grown by pad, and its top-left corner."""
     h, w = frame.shape[:2]
     bw, bh = box[2] - box[0], box[3] - box[1]
     x0 = max(0, int(box[0] - bw * pad))
     y0 = max(0, int(box[1] - bh * pad))
     x1 = min(w, int(box[2] + bw * pad))
     y1 = min(h, int(box[3] + bh * pad))
-    return frame[y0:y1, x0:x1]
+    return frame[y0:y1, x0:x1], (x0, y0)
+
+
+def crop(frame, box, pad: float):
+    return crop_region(frame, box, pad)[0]
 
 
 def draw(frame, tracks, fps: float):
@@ -449,6 +585,9 @@ def draw(frame, tracks, fps: float):
         colour = colours[direction]
         x0, y0, x1, y1 = t.box
         cv2.rectangle(frame, (x0, y0), (x1, y1), colour, 2)
+        if t.plate_box is not None:
+            p = t.plate_box
+            cv2.rectangle(frame, (p[0], p[1]), (p[2], p[3]), (255, 255, 0), 1)
         plate = t.plate or "?"
         if t.plate and not t.plate_confirmed:
             plate += "?"
@@ -472,23 +611,72 @@ def mirage_options(sections):
     return options
 
 
-def assign_text(tracks, lines):
+def owner_of(tracks, box):
+    """The vehicle whose box holds box's centre; the smallest is the most specific."""
+    cx, cy = centre(box)
+    owners = [t for t in tracks if contains_point(t.box, cx, cy)]
+    return min(owners, key=lambda t: area(t.box)) if owners else None
+
+
+def split_objects(objects):
+    """Split parsed objects into (vehicles, plate boxes, ignored-text boxes)."""
+    vehicles = drop_duplicates([o for o in objects if is_vehicle(o[0])])
+    plates = [o[2] for o in objects if is_plate(o[0])]
+    ignored = [o[2] for o in objects if is_ignored_region(o[0])]
+    return vehicles, plates, ignored
+
+
+def assign_plates(tracks, plate_boxes):
+    for track in tracks:
+        track.plate_box = None
+    for box in plate_boxes:
+        owner = owner_of(tracks, box)
+        if owner is not None and (owner.plate_box is None or area(box) > area(owner.plate_box)):
+            owner.plate_box = box
+
+
+def vote(track, text, box, ignored):
+    """Add text read at box (frame pixels, or None) to track's plate votes."""
+    if box is not None and any(contains_point(b, *centre(box)) for b in ignored):
+        return
+    weight = 1
+    if box is not None and track.plate_box is not None and contains_point(track.plate_box, *centre(box)):
+        weight = PLATE_BOX_VOTES
+    for plate in plate_candidates(text):
+        track.plate_votes[plate] += weight
+
+
+def assign_text(tracks, lines, ignored=()):
     """Vote text lines whose centre falls inside a vehicle box for that vehicle."""
     for text, box in lines:
         if box is None:
             continue
-        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-        owners = [t for t in tracks if t.box[0] <= cx <= t.box[2] and t.box[1] <= cy <= t.box[3]]
-        if not owners:
-            continue
-        # The smallest enclosing box is the most specific vehicle.
-        owner = min(owners, key=lambda t: (t.box[2] - t.box[0]) * (t.box[3] - t.box[1]))
-        for plate in plate_candidates(text):
-            owner.plate_votes[plate] += 1
+        owner = owner_of(tracks, box)
+        if owner is not None:
+            vote(owner, text, box, ignored)
+
+
+def crop_pass(vision, frame, track, ignored):
+    """Read the plate (or the whole vehicle) again at full resolution."""
+    if track.plate_box is not None and track.plate_box[2] - track.plate_box[0] >= PLATE_CROP_MIN_WIDTH:
+        box, pad = track.plate_box, PLATE_CROP_PAD
+    elif track.box[2] - track.box[0] >= CROP_MIN_WIDTH:
+        box, pad = track.box, CROP_PAD
+    else:
+        return
+    piece, (ox, oy) = crop_region(frame, box, pad)
+    if piece.size == 0:
+        return
+    result = vision.describe(np.ascontiguousarray(piece[:, :, ::-1]), **mirage_options(["text"]))
+    for text, tbox in parse_text(result, piece.shape[1], piece.shape[0]):
+        if tbox is not None:
+            tbox = (tbox[0] + ox, tbox[1] + oy, tbox[2] + ox, tbox[3] + oy)
+        vote(track, text, tbox, ignored)
 
 
 def parse_args(argv=None):
     global SOURCE, APPROACH, DUMP_JSON, BBOX_ORDER, SHOW_WINDOW, MAX_FPS, OUTPUT_DIR, PLATE_REGEX, _plate_re
+    global PLATE_FORMATS
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--source", default=SOURCE, help="RTSP URL, video file or webcam number")
     p.add_argument("--approach", default=APPROACH, choices=["down", "up", "left", "right"],
@@ -497,6 +685,8 @@ def parse_args(argv=None):
                    help="print Mirage's raw JSON for the first frames")
     p.add_argument("--bbox-order", default=BBOX_ORDER, choices=["xyxy", "yxyx"])
     p.add_argument("--plate-regex", default=PLATE_REGEX)
+    p.add_argument("--plate-format", action="append", default=None, metavar="LAYOUT",
+                   help="plate layout such as AA99AAA (A = letter, 9 = digit); repeat for several")
     p.add_argument("--max-fps", type=float, default=MAX_FPS)
     p.add_argument("--no-window", action="store_true", help="run without the preview window")
     p.add_argument("--output", default=OUTPUT_DIR, help="folder for events.csv and snapshots")
@@ -506,6 +696,11 @@ def parse_args(argv=None):
     BBOX_ORDER, MAX_FPS, OUTPUT_DIR = args.bbox_order, args.max_fps, args.output
     SHOW_WINDOW = SHOW_WINDOW and not args.no_window
     PLATE_REGEX, _plate_re = args.plate_regex, re.compile(args.plate_regex)
+    if args.plate_format:
+        bad = [f for f in args.plate_format if not re.fullmatch(r"[A9]+", f.upper())]
+        if bad:
+            p.error(f"plate layouts use only A and 9: {', '.join(bad)}")
+        PLATE_FORMATS = tuple(f.upper() for f in args.plate_format)
     return args
 
 
@@ -537,23 +732,18 @@ def main(argv=None):
             if DUMP_JSON and processed < DUMP_JSON_FRAMES:
                 print(json.dumps(result, ensure_ascii=False, indent=2)[:6000])
 
-            vehicles = [d for d in parse_objects(result, width, height) if is_vehicle(d[0])]
+            vehicles, plate_boxes, ignored = split_objects(parse_objects(result, width, height))
             now = time.time()
             active, finished = tracker.update(vehicles, width, height, now)
-            assign_text(active, parse_text(result, width, height))
+            assign_plates(active, plate_boxes)
+            assign_text(active, parse_text(result, width, height), ignored)
 
             for track in active:
-                area = (track.box[2] - track.box[0]) * (track.box[3] - track.box[1])
-                if SAVE_SNAPSHOTS and area > track.best_area:
-                    track.best_area, track.best_snapshot = area, crop(frame, track.box, CROP_PAD).copy()
-                if (CROP_PASS and not track.plate_confirmed and processed % max(1, CROP_EVERY) == 0
-                        and track.box[2] - track.box[0] >= CROP_MIN_WIDTH):
-                    piece = crop(frame, track.box, CROP_PAD)
-                    piece_rgb = np.ascontiguousarray(piece[:, :, ::-1])
-                    crop_result = vision.describe(piece_rgb, **mirage_options(["text"]))
-                    for text, _ in parse_text(crop_result, piece.shape[1], piece.shape[0]):
-                        for plate in plate_candidates(text):
-                            track.plate_votes[plate] += 1
+                size = area(track.box)
+                if SAVE_SNAPSHOTS and size > track.best_area:
+                    track.best_area, track.best_snapshot = size, crop(frame, track.box, CROP_PAD).copy()
+                if CROP_PASS and not track.plate_confirmed and processed % max(1, CROP_EVERY) == 0:
+                    crop_pass(vision, frame, track, ignored)
 
             for track in finished:
                 log.write(track)

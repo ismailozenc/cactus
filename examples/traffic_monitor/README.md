@@ -59,7 +59,11 @@ root folder of the clone. Also install the clone's `requirements.txt`
 | --- | --- |
 | `SOURCE` | RTSP URL, a video file, or a webcam number such as `"0"`. A recording is the easiest way to tune. |
 | `APPROACH` | Screen direction a vehicle moves in when it is coming towards you: `down`, `up`, `left`, `right`. |
-| `PLATE_REGEX` | Your country's plate format after removing spaces and dashes. Tightening it removes most misreads. |
+| `PLATE_FORMATS` | Plate layouts, `A` = letter and `9` = digit, e.g. `("AA99AAA",)` for the UK. Reads are corrected position by position (BSLIZ6B becomes BS11ZGB). The best accuracy setting. Also `--plate-format AA99AAA`. |
+| `PLATE_REGEX` | Used only when `PLATE_FORMATS` is empty: the plate after removing spaces and dashes. |
+| `IGNORE_TEXT`, `IGNORE_TEXT_IN` | Text that is never a plate (the camera name `CAMERA01`), and object names whose text is skipped (`watermark`). |
+| `PLATE_WORDS`, `PLATE_BOX_VOTES` | Mirage detects "license plate" objects. Text inside one counts double, and the crop pass reads the plate box. |
+| `DUPLICATE_OVERLAP`, `DUPLICATE_SIZE_RATIO` | When two vehicle boxes cover the same vehicle, the smaller one is dropped. |
 | `PLATE_CONFIRM_VOTES` | Identical reads needed before a plate counts as confirmed. |
 | `DUMP_JSON` | Prints Mirage's raw JSON for the first frames. Use it on your first run. |
 | `BBOX_ORDER` | `xyxy` or `yxyx`. Switch it if boxes are drawn in the wrong place. |
@@ -68,15 +72,14 @@ root folder of the clone. Also install the clone's `requirements.txt`
 
 ## First run checklist
 
-1. **Turn on `DUMP_JSON`.** Mirage's exact output key names are not
-   documented in this repository. The parser accepts the common ones
-   (`label`/`name`/`class`, `bbox`/`box`, `text`), but check the dump. If
-   vehicles are never detected, the label or box key probably differs.
-   Adjust `LABEL_KEYS`, `BOX_KEYS` or `TEXT_KEYS` near the top of the parsing
-   code, or the vehicle words in `VEHICLE_WORDS`.
+1. **Turn on `DUMP_JSON`** (or pass `--dump-json`) to see Mirage's raw output.
+   Checked on a real camera: objects come as `{"id", "name", "bbox"}`,
+   text lines as `{"string", "bbox"}`, and boxes are `x0, y0, x1, y1` on a
+   0-1000 grid. The parser already handles that.
 2. **Check the boxes line up** with the vehicles in the preview. If they do
    not, set `BBOX_ORDER = "yxyx"`.
-3. **Set `PLATE_REGEX`** for your country.
+3. **Set `PLATE_FORMATS`** for your country, and add your camera's
+   on-screen name to `IGNORE_TEXT`.
 4. **Set `APPROACH`** by watching one vehicle come towards the camera.
 
 ## How direction and plates work

@@ -120,3 +120,84 @@ def test_end_to_end_on_a_video(tmp_path, monkeypatch, move, expected):
     assert rows[0]["direction"] == expected
     assert rows[0]["plate"] == "34ABC123" and rows[0]["plate_confirmed"] == "True"
     assert (out / rows[0]["snapshot"]).exists()
+
+
+# Frames 1 and 2 as Mirage returned them from a real camera (0-1000 grid).
+REAL_FRAME_1 = {
+    "objects": [
+        {"id": 1, "name": "tree", "bbox": [64, 122, 236, 195]},
+        {"id": 2, "name": "car", "bbox": [315, 210, 385, 265]},
+        {"id": 3, "name": "car", "bbox": [117, 208, 394, 443]},
+        {"id": 4, "name": "car", "bbox": [225, 221, 382, 426]},
+        {"id": 5, "name": "car", "bbox": [460, 131, 928, 436]},
+        {"id": 6, "name": "wooden pallet", "bbox": [11, 475, 406, 796]},
+        {"id": 8, "name": "text", "bbox": [737, 797, 835, 813]},
+    ],
+    "text": [{"string": "Camera01", "bbox": [731, 791, 841, 818]}],
+}
+REAL_FRAME_2 = {
+    "objects": [
+        {"id": 4, "name": "car", "bbox": [110, 220, 376, 508]},
+        {"id": 6, "name": "car", "bbox": [323, 132, 938, 766]},
+        {"id": 7, "name": "license plate", "bbox": [379, 619, 516, 693]},
+        {"id": 8, "name": "grille", "bbox": [333, 453, 619, 730]},
+        {"id": 9, "name": "watermark", "bbox": [734, 798, 837, 813]},
+    ],
+    "text": [{"string": "BSLIZ6B", "bbox": [374, 607, 521, 701]},
+             {"string": "Camera01", "bbox": [726, 791, 845, 818]}],
+}
+
+
+def test_vehicle_words_are_whole_words():
+    assert tm.is_vehicle("car") and tm.is_vehicle("pickup truck") and tm.is_vehicle("cars")
+    for label in ("bush", "scar", "card", "license plate", "car door", "grille", "caravan park"):
+        assert not tm.is_vehicle(label), label
+
+
+def test_real_frame_duplicates_dropped_small_car_behind_kept():
+    vehicles, plates, ignored = tm.split_objects(tm.parse_objects(REAL_FRAME_1, 1000, 1000))
+    boxes = sorted(v[2] for v in vehicles)
+    # car 4 is a second box on car 3; car 2 is a distant car and stays.
+    assert boxes == [(117, 208, 394, 443), (315, 210, 385, 265), (460, 131, 928, 436)]
+    assert plates == [] and ignored == []
+
+
+def test_camera_name_is_never_a_plate():
+    assert tm.plate_candidates("Camera01") == []
+    tracker = tm.Tracker()
+    active, _ = tracker.update([("car", None, (0, 0, 1000, 1000))], 1000, 1000, 0)
+    tm.assign_text(active, tm.parse_text(REAL_FRAME_1, 1000, 1000))
+    assert not active[0].plate_votes
+
+
+def test_real_frame_plate_box_and_uk_layout(monkeypatch):
+    monkeypatch.setattr(tm, "PLATE_FORMATS", ("AA99AAA",))
+    monkeypatch.setattr(tm, "IGNORE_TEXT", ())   # rely on the "watermark" box alone
+    vehicles, plates, ignored = tm.split_objects(tm.parse_objects(REAL_FRAME_2, 1000, 1000))
+    assert plates == [(379, 619, 516, 693)] and ignored == [(734, 798, 837, 813)]
+    active, _ = tm.Tracker().update(vehicles, 1000, 1000, 0)
+    tm.assign_plates(active, plates)
+    tm.assign_text(active, tm.parse_text(REAL_FRAME_2, 1000, 1000), ignored)
+    close_car = next(t for t in active if t.box == (323, 132, 938, 766))
+    assert close_car.plate_box == (379, 619, 516, 693)
+    assert dict(close_car.plate_votes) == {"BS11ZGB": tm.PLATE_BOX_VOTES}
+    assert not any(t.plate_votes for t in active if t is not close_car)
+
+
+def test_plate_layouts(monkeypatch):
+    monkeypatch.setattr(tm, "PLATE_FORMATS", ("AA99AAA",))
+    assert tm.plate_candidates("BSLIZ6B") == ["BS11ZGB"]
+    assert tm.plate_candidates("GB BS11 ZGB") == ["BS11ZGB"]   # country band dropped
+    assert tm.plate_candidates("STOP") == []
+    assert tm.plate_candidates("SPEED 50") == []
+    monkeypatch.setattr(tm, "PLATE_FORMATS", ("99A9999", "99AA999", "99AAA99"))
+    assert tm.plate_candidates("34 ABC 12") == ["34ABC12"]
+    assert tm.plate_candidates("B4 AB 123") == ["84AB123"]
+
+
+def test_plate_format_argument(monkeypatch):
+    monkeypatch.setattr(tm, "PLATE_FORMATS", ())
+    tm.parse_args(["--plate-format", "aa99aaa", "--no-window"])
+    assert tm.PLATE_FORMATS == ("AA99AAA",)
+    with pytest.raises(SystemExit):
+        tm.parse_args(["--plate-format", "AA-99"])
