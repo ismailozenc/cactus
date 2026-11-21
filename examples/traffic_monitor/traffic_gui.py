@@ -116,6 +116,13 @@ SETTINGS = {
          (0.0, 1.0, 0.05)),
         ("DUPLICATE_SIZE_RATIO", "float", "Duplicate size ratio", "...unless it is smaller than this share of the bigger "
          "box, which means a car further away.", (0.0, 1.0, 0.05)),
+        ("MASK_STATIC", "bool", "Hide still parts from Mirage", "Paints everything that is not moving flat grey "
+         "before Mirage reads the image, so parked cars and other still things cannot be detected. Needs the "
+         "motion gate.", None),
+        ("MASK_PAD", "float", "Visible margin around motion", "How much around each moving area stays visible, as a "
+         "share of its size. Raise it if moving cars are cut off in the Mirage view.", (0.0, 3.0, 0.05)),
+        ("MASK_MIN_VISIBLE", "float", "Vehicle must be visible", "Share of a vehicle's box that must be in the "
+         "visible part; anything mostly in the grey is dropped.", (0.0, 1.0, 0.05)),
         ("BBOX_ORDER", "choice", "Box order", "Switch to yxyx only if boxes are drawn in the wrong place.",
          ("xyxy", "yxyx")),
     ],
@@ -159,6 +166,9 @@ SETTINGS = {
          "biggest.", None),
         ("MAX_FPS", "float", "Max video frames per second", "Cap on the video and motion check. Mirage runs on the "
          "newest frame whenever it is free, as fast as the computer allows. 0 = no cap.", (0, 60, 1)),
+        ("SHOW_MIRAGE_VIEW", "bool", "Show what Mirage sees beside the video", "Splits the video area: the camera "
+         "on the left, and on the right the exact image of Mirage's last pass (hidden parts grey) with everything "
+         "it reported: vehicles green, plates cyan, other objects grey, text yellow.", None),
         ("DUMP_JSON", "bool", "Show Mirage's raw output in the log", "Prints the JSON Mirage returns for the first "
          "frames after Start.", None),
         ("DUMP_JSON_FRAMES", "int", "Frames to show", "How many frames of raw output to print.", (1, 1000)),
@@ -222,6 +232,18 @@ def all_specs():
 
 DEFAULTS = {name: getattr(tm, name) for name, *_ in all_specs()}
 DEFAULTS["SOURCE"] = tm.SOURCE
+DEFAULTS["IGNORE_ZONES"] = ()
+
+
+def parse_zones(value):
+    """Saved zones -> tuple of (x0, y0, x1, y1) fractions; raises ValueError if malformed."""
+    zones = []
+    for zone in value:
+        x0, y0, x1, y1 = (float(v) for v in zone)
+        if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+            raise ValueError("zone outside the frame")
+        zones.append((x0, y0, x1, y1))
+    return tuple(zones)
 
 
 def load_settings():
@@ -231,6 +253,10 @@ def load_settings():
         return
     kinds = {name: (kind, extra) for name, kind, _, _, extra in all_specs()}
     kinds["SOURCE"] = ("text", None)
+    try:
+        tm.IGNORE_ZONES = parse_zones(saved.get("IGNORE_ZONES", ()))
+    except (TypeError, ValueError):
+        pass
     for name, value in saved.items():
         if name not in kinds or value in OLD_DEFAULTS.get(name, []):
             continue
@@ -261,6 +287,44 @@ def open_path(path):
         subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
 
 
+class Panel:
+    """A canvas showing a BGR image scaled to fit, remembering where it put it."""
+
+    def __init__(self, canvas, placeholder):
+        self.canvas, self.placeholder = canvas, placeholder
+        self.image, self.photo, self.geometry = None, None, None
+        canvas.bind("<Configure>", lambda _e: self.render())
+
+    def show(self, image):
+        self.image = image
+        self.render()
+
+    def render(self):
+        canvas = self.canvas
+        width, height = max(canvas.winfo_width(), 20), max(canvas.winfo_height(), 20)
+        canvas.delete("picture")
+        if self.image is None:
+            canvas.create_text(width / 2, height / 2, text=self.placeholder, fill="#bbbbbb",
+                               font=("Segoe UI", 11), tags="picture", width=width - 20, justify=tk.CENTER)
+            return
+        ih, iw = self.image.shape[:2]
+        scale = min(width / iw, height / ih)
+        size = (max(1, int(iw * scale)), max(1, int(ih * scale)))
+        small = cv2.resize(self.image, size, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+        self.photo = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
+        ox, oy = (width - size[0]) // 2, (height - size[1]) // 2
+        canvas.create_image(ox, oy, anchor=tk.NW, image=self.photo, tags="picture")
+        canvas.tag_lower("picture")
+        self.geometry = (ox, oy, scale, iw, ih)
+
+    def to_image(self, x, y):
+        """Canvas point -> image pixel (clamped), or None before anything is shown."""
+        if self.geometry is None:
+            return None
+        ox, oy, scale, iw, ih = self.geometry
+        return min(iw, max(0.0, (x - ox) / scale)), min(ih, max(0.0, (y - oy) / scale))
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -269,6 +333,7 @@ class App:
         self.worker, self.stop_event = None, threading.Event()
         self.monitor = None
         self.latest = None            # newest annotated frame from the worker
+        self.latest_view = None       # newest picture of what Mirage saw
         self.latest_lock = threading.Lock()
         self.photo = None
         self.vars, self.errors = {}, {}
@@ -286,6 +351,7 @@ class App:
         style.configure("Help.TLabel", foreground="#555555")
         style.configure("Error.TLabel", foreground="#c62828")
         style.configure("Status.TLabel", padding=(8, 4))
+        style.configure("Caption.TLabel", foreground="#444444", font=("Segoe UI", 9, "bold"))
 
         self._build_top()
         self._build_body()
@@ -324,10 +390,33 @@ class App:
         vertical.add(top, weight=3)
 
         video_frame = ttk.Frame(top)
-        self.video = tk.Label(video_frame, bg="#111111", fg="#bbbbbb",
-                              text="Press Start to connect to the camera", font=("Segoe UI", 12))
-        self.video.pack(fill=tk.BOTH, expand=True)
         top.add(video_frame, weight=3)
+        tools = ttk.Frame(video_frame)
+        tools.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(tools, text="Add ignore zone", command=self.start_zone).pack(side=tk.LEFT)
+        ttk.Button(tools, text="Clear zones", command=self.clear_zones).pack(side=tk.LEFT, padx=4)
+        self.zone_hint = tk.StringVar(value="")
+        ttk.Label(tools, textvariable=self.zone_hint, style="Help.TLabel").pack(side=tk.LEFT, padx=8)
+        self.panels = ttk.Frame(video_frame)
+        self.panels.pack(fill=tk.BOTH, expand=True)
+        self.panels.rowconfigure(1, weight=1)
+        canvases = []
+        for column, title in enumerate(("Camera", "What Mirage sees (last pass)")):
+            ttk.Label(self.panels, text=title, style="Caption.TLabel").grid(row=0, column=column, sticky=tk.W)
+            canvas = tk.Canvas(self.panels, bg="#111111", highlightthickness=0, width=200, height=150)
+            canvas.grid(row=1, column=column, sticky=tk.NSEW, padx=(0 if column == 0 else 4, 0))
+            canvases.append(canvas)
+        self.camera = Panel(canvases[0], "Press Start to connect to the camera")
+        self.mirage_panel = Panel(canvases[1], "The image Mirage reads appears here after its first pass. "
+                                               "Grey parts are hidden from it.")
+        self.mirage_title = self.panels.grid_slaves(row=0, column=1)[0]
+        canvas = self.camera.canvas
+        canvas.bind("<ButtonPress-1>", self.zone_press)
+        canvas.bind("<B1-Motion>", self.zone_drag)
+        canvas.bind("<ButtonRelease-1>", self.zone_release)
+        canvas.bind("<Button-3>", self.zone_remove)
+        self.zone_mode, self.drag_start = False, None
+        self.layout_panels()
 
         side = ttk.Frame(top, padding=(8, 0, 0, 0))
         top.add(side, weight=1)
@@ -488,6 +577,8 @@ class App:
             return
         if kind == "bool":
             setattr(tm, name, bool(var.get()))
+            if name == "SHOW_MIRAGE_VIEW":
+                self.layout_panels()
             return
         try:
             value = parse_value(kind, extra, var.get())
@@ -573,9 +664,14 @@ class App:
                 post("stats", stats)
                 return False
 
+            def on_view(view):
+                picture = tm.draw_mirage_view(view)
+                with self.latest_lock:
+                    self.latest_view = picture
+
             self.monitor = tm.Monitor(self.vision, source, output, on_frame=on_frame,
                                       on_event=lambda row: post("event", row),
-                                      log=lambda message: post("log", message))
+                                      log=lambda message: post("log", message), on_view=on_view)
             self.monitor.run(self.stop_event)
         except tm.MissingPackage as exc:
             post("error", str(exc))
@@ -632,15 +728,98 @@ class App:
     def refresh_video(self):
         with self.latest_lock:
             frame, self.latest = self.latest, None
+            view, self.latest_view = self.latest_view, None
         if frame is not None:
-            width = max(self.video.winfo_width(), 50)
-            height = max(self.video.winfo_height(), 50)
-            scale = min(width / frame.shape[1], height / frame.shape[0])
-            size = (max(1, int(frame.shape[1] * scale)), max(1, int(frame.shape[0] * scale)))
-            frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
-            self.photo = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-            self.video.configure(image=self.photo, text="")
+            self.camera.show(frame)
+            self.draw_zone_outlines()
+        if view is not None and tm.SHOW_MIRAGE_VIEW:
+            self.mirage_panel.show(view)
         self.root.after(33, self.refresh_video)
+
+    def layout_panels(self):
+        """Camera alone, or camera and Mirage's view side by side."""
+        both = bool(tm.SHOW_MIRAGE_VIEW)
+        self.panels.columnconfigure(0, weight=1, uniform="panel")
+        self.panels.columnconfigure(1, weight=1 if both else 0, uniform="panel" if both else "")
+        if both:
+            self.mirage_panel.canvas.grid()
+            self.mirage_title.grid()
+        else:
+            self.mirage_panel.canvas.grid_remove()
+            self.mirage_title.grid_remove()
+
+    # ------------------------------------------------------- ignore zones --
+
+    def draw_zone_outlines(self):
+        canvas = self.camera.canvas
+        canvas.delete("zone")
+        if self.camera.geometry is None:
+            return
+        ox, oy, scale, iw, ih = self.camera.geometry
+        for zone in tm.IGNORE_ZONES:
+            x0, y0, x1, y1 = tm.zone_pixels(zone, iw, ih)
+            canvas.create_rectangle(ox + x0 * scale, oy + y0 * scale, ox + x1 * scale, oy + y1 * scale,
+                                    outline="#ffffff", dash=(4, 3), tags="zone")
+
+    def start_zone(self):
+        if self.camera.geometry is None:
+            messagebox.showinfo("Traffic Monitor", "Press Start first, then draw the zone on the video.")
+            return
+        self.zone_mode = True
+        self.camera.canvas.configure(cursor="crosshair")
+        self.zone_hint.set("Drag a rectangle on the camera image over what Mirage should ignore.")
+
+    def zone_press(self, event):
+        if self.zone_mode:
+            self.drag_start = (event.x, event.y)
+            self.camera.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#ffff00",
+                                                width=2, tags="drag")
+
+    def zone_drag(self, event):
+        if self.drag_start:
+            self.camera.canvas.coords("drag", *self.drag_start, event.x, event.y)
+
+    def zone_release(self, event):
+        if not self.drag_start:
+            return
+        start, self.drag_start = self.drag_start, None
+        self.camera.canvas.delete("drag")
+        a, b = self.camera.to_image(*start), self.camera.to_image(event.x, event.y)
+        ox, oy, scale, iw, ih = self.camera.geometry
+        zone = (min(a[0], b[0]) / iw, min(a[1], b[1]) / ih, max(a[0], b[0]) / iw, max(a[1], b[1]) / ih)
+        self.zone_mode = False
+        self.camera.canvas.configure(cursor="")
+        if zone[2] - zone[0] < 0.01 or zone[3] - zone[1] < 0.01:
+            self.zone_hint.set("Too small; press Add ignore zone and drag a bigger rectangle.")
+            return
+        zone = tuple(round(v, 4) for v in zone)
+        tm.IGNORE_ZONES = tuple(tm.IGNORE_ZONES) + (zone,)
+        save_settings()
+        self.draw_zone_outlines()
+        self.zone_hint.set(f"{len(tm.IGNORE_ZONES)} ignore zone(s). Right-click a zone to remove it.")
+        self.log(f"Ignore zone added: {zone} (fractions of the frame).")
+
+    def zone_remove(self, event):
+        point = self.camera.to_image(event.x, event.y)
+        if point is None:
+            return
+        ox, oy, scale, iw, ih = self.camera.geometry
+        x, y = point[0] / iw, point[1] / ih
+        for zone in reversed(tm.IGNORE_ZONES):
+            if zone[0] <= x <= zone[2] and zone[1] <= y <= zone[3]:
+                tm.IGNORE_ZONES = tuple(z for z in tm.IGNORE_ZONES if z != zone)
+                save_settings()
+                self.draw_zone_outlines()
+                self.zone_hint.set(f"Zone removed; {len(tm.IGNORE_ZONES)} left.")
+                self.log(f"Ignore zone removed: {zone}.")
+                return
+
+    def clear_zones(self):
+        if tm.IGNORE_ZONES and messagebox.askyesno("Traffic Monitor", "Remove all ignore zones?"):
+            tm.IGNORE_ZONES = ()
+            save_settings()
+            self.draw_zone_outlines()
+            self.zone_hint.set("All ignore zones removed.")
 
     def add_event(self, row):
         snapshot = self.output_dir / row["snapshot"] if row["snapshot"] and self.output_dir else None

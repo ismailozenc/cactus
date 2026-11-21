@@ -267,7 +267,7 @@ def test_motion_gate_skips_still_frames_and_crops_motion(monkeypatch):
     monkeypatch.setattr(tm, "MOTION_LEARN_SECONDS", 10.0)
     gate = tm.MotionGate()
     parked = (500, 250, 600, 320)
-    assert gate.update(street([parked]), 0.0).action == "full"      # first frame: learn it
+    assert gate.update(street([parked]), 0.0).action == "skip"      # first frame: learn it, nothing moves yet
     assert gate.update(street([parked]), 0.1).action == "skip"      # parked car is background
     moving = (100, 100, 180, 160)
     motion = gate.update(street([parked, moving]), 0.2)
@@ -295,7 +295,7 @@ def test_motion_gate_resets_on_whole_scene_change_and_ignores_clock(monkeypatch)
     gate = tm.MotionGate()
     gate.update(street(), 0.0)
     changed = gate.update(street(brightness=200), 0.1)
-    assert changed.action == "full" and "reset" in changed.reason
+    assert changed.action == "skip" and "reset" in changed.reason
     assert gate.update(street(brightness=200), 0.2).action == "skip"
     gate.ignore = [(520, 320, 640, 360)]                       # e.g. a "watermark" clock
     clock = street(brightness=200)
@@ -435,7 +435,7 @@ def test_brightness_change_of_the_whole_picture_is_not_motion(monkeypatch):
     monkeypatch.setattr(tm, "MOTION_EXPOSURE", False)
     gate = tm.MotionGate()
     gate.update(scene, 0.0)
-    assert gate.update(brighter, 0.1).action == "full"          # without it: everything "moved"
+    assert "reset" in gate.update(brighter, 0.1).reason        # without it: everything "moved"
 
 
 class FakeLiveReader:
@@ -540,4 +540,108 @@ def test_next_car_in_the_queue_is_not_taken_for_the_one_ahead():
     tracker.update([("car", None, (100, 380, 200, 440))], 1000, 1000, 1.0)   # driving down at 80 px/s
     # Car A is not detected; car B appears behind it (further up), within reach by distance.
     tracker.update([("car", None, (100, 250, 200, 310))], 1000, 1000, 2.0)
+    assert sorted(tracker.tracks) == [1, 2]
+
+
+# ------------------------------------------------ masking and ignore zones --
+
+def test_without_masking_first_frame_and_reset_go_to_mirage_whole(monkeypatch):
+    monkeypatch.setattr(tm, "MASK_STATIC", False)
+    gate = tm.MotionGate()
+    assert gate.update(street(), 0.0).action == "full"
+    assert gate.update(street(brightness=200), 0.1).action == "full"
+
+
+def test_mirage_sees_only_moving_areas_and_never_ignore_zones(monkeypatch):
+    parked = (450, 200, 560, 280)
+    moving = (100, 100, 180, 160)
+    frame = street([parked, moving])
+    motion = tm.Motion("full", "test", boxes=[moving])
+    image, offset, keep = tm.mirage_input(frame, motion)
+    assert offset == (0, 0) and image.shape == frame.shape
+    assert (image[220:260, 470:540] == tm.MASK_GREY).all()            # parked car painted out
+    assert (image[110:150, 110:170] == 255).all()                     # moving car untouched
+    assert tm.visible_share(parked, keep) == 0.0 and tm.visible_share(moving, keep) == 1.0
+    monkeypatch.setattr(tm, "IGNORE_ZONES", ((0.1, 0.2, 0.4, 0.6),))   # covers the moving car
+    image, _, keep = tm.mirage_input(frame, motion)
+    assert (image[110:150, 110:170] == tm.MASK_GREY).all()
+    crop = tm.Motion("crop", "test", region=(50, 50, 300, 250), boxes=[moving])
+    monkeypatch.setattr(tm, "IGNORE_ZONES", ())
+    image, offset, _ = tm.mirage_input(frame, crop)
+    assert offset == (50, 50) and image.shape[:2] == (200, 250)
+
+
+def test_motion_inside_an_ignore_zone_is_not_motion(monkeypatch):
+    monkeypatch.setattr(tm, "IGNORE_ZONES", ((0.6, 0.5, 1.0, 1.0),))
+    gate = tm.MotionGate()
+    gate.update(street(), 0.0)
+    assert gate.update(street([(450, 220, 600, 330)]), 0.1).action == "skip"   # inside the zone
+    assert gate.update(street([(50, 50, 150, 120)]), 0.2).action == "crop"      # outside it
+
+
+def test_mirage_view_drawing():
+    view = tm.MirageView(3, street([(100, 100, 180, 160)]), (10, 20),
+                         [("car", None, (100, 100, 180, 160)), ("tree", None, (10, 10, 60, 80))],
+                         [("SB FN 79E", (110, 140, 170, 155))], 1.234, False)
+    picture = tm.draw_mirage_view(view)
+    assert picture.shape[0] == 360 + 26 and picture.shape[1] == 640
+
+
+def test_end_to_end_parked_car_beside_the_road_is_never_tracked(tmp_path, monkeypatch):
+    """A parked car right next to the road ends up inside the crop: masking
+    paints it out, so Mirage never reports it and it never becomes a track."""
+    video = tmp_path / "street.avi"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (640, 360))
+    parked = (200, 150, 300, 210)      # 20 px from the road: a slice shows in the moving car's margin
+    for i in range(50):
+        cars = [parked]
+        if 10 <= i < 40:
+            y = 20 + 9 * (i - 10)
+            cars.append((80, y, 180, y + 60))
+        writer.write(street(cars))
+    writer.release()
+    monkeypatch.setitem(sys.modules, "cactus", types.SimpleNamespace(Mirage=CountingMirage))
+    monkeypatch.setattr(tm, "CROP_PASS", False)
+    monkeypatch.setattr(tm, "MOTION_MIN_CROP", 0.6)   # crop wider than the visible margin: grey cuts the slice
+    seen = []
+    real = tm.Monitor._analyse
+
+    def spy(self, frame, motion, now):
+        real(self, frame, motion, now)
+        seen.append(self.last_view)
+
+    monkeypatch.setattr(tm.Monitor, "_analyse", spy)
+    tracked = []
+    real_update = tm.Tracker.update
+
+    def update_spy(self, detections, *args, **kwargs):
+        tracked.extend(d[2] for d in detections)
+        return real_update(self, detections, *args, **kwargs)
+
+    monkeypatch.setattr(tm.Tracker, "update", update_spy)
+    out = tmp_path / "out"
+    tm.main(["--source", str(video), "--no-window", "--output", str(out), "--max-fps", "0"])
+    rows = list(csv.DictReader(open(out / "events.csv", encoding="utf-8")))
+    assert [r["direction"] for r in rows] == ["coming"]
+    # Not even a slice of the parked car (showing through the margin around the moving one) is tracked.
+    assert tracked and not any(tm.area(tm.overlap(box, parked)) > 0 for box in tracked), tracked
+    # Mirage never saw the whole parked car (it was grey apart from a slice in the margin).
+    for view in seen:
+        x0, y0 = view.offset
+        for label, _, box in view.objects:
+            assert tm.iou(tm.shift(box, x0, y0), parked) < 0.5, (view.number, box)
+
+
+def test_slice_of_a_still_object_at_the_edge_of_the_visible_area_is_dropped():
+    keep = np.zeros((360, 640), bool)
+    keep[50:250, 50:300] = True                                   # visible area around a moving car
+    assert not tm.cut_by_mask((120, 100, 220, 160), keep)         # the moving car, well inside
+    assert tm.cut_by_mask((270, 120, 300, 200), keep)             # slice of a parked car at the edge
+    assert not tm.cut_by_mask((0, 0, 50, 50), None)
+
+
+def test_a_big_still_object_does_not_capture_a_car_nearby():
+    tracker = tm.Tracker()
+    tracker.update([("car", None, (510, 430, 891, 539))], 960, 540, 0.0)    # big white thing, wrongly "car"
+    tracker.update([("car", None, (200, 134, 341, 225))], 960, 540, 1.0)    # a real car, 1.4 big-boxes away
     assert sorted(tracker.tracks) == [1, 2]

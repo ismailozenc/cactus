@@ -78,6 +78,25 @@ is published) and the Mirage weights from Hugging Face, then caches them.
   you close the window. **Reset all settings to defaults** undoes everything.
   That file can contain your camera password, so it is kept out of git.
 
+## What Mirage sees, masking and ignore zones
+
+* **Side by side:** the left panel is the camera; the right panel, **What
+  Mirage sees**, is the exact image of Mirage's last pass with everything it
+  reported: vehicles green, plates cyan, other objects grey with their names,
+  text yellow. The caption gives the pass number, the crop and the time it
+  took. Turn it off under **Output > Show what Mirage sees beside the video**.
+* **Masking** (**Detection > Hide still parts from Mirage**, on by default):
+  before Mirage reads an image, everything that is not moving, apart from a
+  margin around each moving area, is painted flat grey. Parked cars and
+  other still things are not in the picture at all. A vehicle Mirage finds
+  mostly in the grey, or as a slice at the edge of the grey, is dropped. The
+  very first frame is not sent at all, because nothing is known to move yet.
+* **Ignore zones:** press **Add ignore zone** and drag a rectangle on the
+  camera image over anything Mirage should never see or react to (parking
+  spaces, a reflective object, a flag). It is grey for Mirage and never
+  counts as motion. Right-click a zone to remove it, or **Clear zones**.
+  Zones are saved with the settings.
+
 ## Saving CPU: the motion gate
 
 Mirage costs the same for every image it reads, whatever is in it, so the
@@ -148,6 +167,10 @@ The window shows all of these. Their names in `traffic_monitor.py`:
 | `BBOX_ORDER` | `xyxy` or `yxyx`. Switch it if boxes are drawn in the wrong place. |
 | `CROP_PASS`, `CROP_EVERY`, `CROP_MIN_WIDTH` | Second, full-resolution read of an unconfirmed vehicle: at most one per Mirage pass, to the one that waited longest. Costs speed. |
 | `MOTION_GATE`, `MOTION_*` | The motion gate described above (Motion tab). |
+| `MASK_STATIC`, `MASK_PAD`, `MASK_MIN_VISIBLE` | Masking (Detection tab): hide still parts from Mirage. |
+| `IGNORE_ZONES` | Rectangles, as fractions of the frame, that Mirage never sees. Drawn in the window. |
+| `SHOW_MIRAGE_VIEW` | Show what Mirage sees beside the video. |
+| `MATCH_DISTANCE` | Furthest a vehicle may move between Mirage passes, in box sizes of similar-sized boxes. |
 | `PARKED_SECONDS`, `PARKED_MOVE`, `LOG_PARKED` | When a vehicle counts as parked, and whether parked vehicles are logged. |
 | `MAX_UNSEEN_SECONDS` | A vehicle outside the area Mirage read is logged and forgotten after this long. |
 | `MAX_FPS`, `SHOW_WINDOW`, `OUTPUT_DIR` | Frame cap, preview window, and output folder. |
