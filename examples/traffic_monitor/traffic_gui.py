@@ -237,6 +237,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(50, self.poll)
         self.root.after(150, self._place_sashes)
+        self.root.after(300, self._check_packages)
         self.root.after(33, self.refresh_video)
         self.set_running(False)
 
@@ -354,6 +355,42 @@ class App:
         for w in widgets:
             w.bind("<Enter>", lambda _e, t=help_text: self.help_var.set(t))
 
+    def _check_packages(self):
+        self.log(f"Python: {sys.executable}")
+        missing = tm.missing_packages()
+        if not missing or (tm.WEIGHTS and missing == ["huggingface_hub"]):
+            return  # huggingface_hub is only needed to download, not with a weights file
+        self.status_var.set(f"Missing {' and '.join(missing)} - see the Log tab")
+        message = tm.missing_message("cactus" if "cactus-compute" in missing else "huggingface_hub")
+        self.log("WARNING: " + message)
+        if messagebox.askyesno("Traffic Monitor", f"Missing: {', '.join(missing)}.\n\n"
+                               f"Install everything in requirements.txt into this Python now?\n\n"
+                               f"{sys.executable}\n\nChoose No to fix it yourself (instructions are "
+                               f"in the Log tab)."):
+            self.install_packages()
+
+    def install_packages(self):
+        """pip install -r requirements.txt into the running Python, output to the Log tab."""
+        self.status_var.set("Installing packages (see the Log tab)...")
+        self.start_btn.configure(state=tk.DISABLED)
+        command = [sys.executable, "-m", "pip", "install", "-r", str(HERE / "requirements.txt")]
+
+        def work():
+            self.queue.put(("log", "> " + " ".join(command)))
+            try:
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, creationflags=flags)
+                for line in proc.stdout:
+                    self.queue.put(("log", line))
+                code = proc.wait()
+            except OSError as exc:
+                self.queue.put(("log", str(exc)))
+                code = -1
+            self.queue.put(("installed", code))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _place_sashes(self):
         self.root.update_idletasks()
         self.top.sashpos(0, max(400, self.top.winfo_width() - 470))
@@ -456,8 +493,7 @@ class App:
         try:
             if self.vision is None or self.vision_weights != weights:
                 post("status", "Loading Mirage (the first run downloads the engine and weights)...")
-                from cactus import Mirage
-                self.vision, self.vision_weights = Mirage(weights=weights), weights
+                self.vision, self.vision_weights = tm.create_mirage(weights), weights
             post("status", "Connecting...")
 
             def on_frame(frame, active, stats):
@@ -470,6 +506,8 @@ class App:
             tm.Monitor(self.vision, source, output, on_frame=on_frame,
                        on_event=lambda row: post("event", row),
                        log=lambda message: post("log", message)).run(self.stop_event)
+        except tm.MissingPackage as exc:
+            post("error", str(exc))
         except tm.SourceError as exc:
             post("error", f"{exc}\n\nCheck the address, that the camera or RTSP server is running, "
                           "and the user name and password.")
@@ -497,6 +535,19 @@ class App:
                 elif kind == "error":
                     self.log("ERROR: " + payload)
                     messagebox.showerror("Traffic Monitor", payload)
+                elif kind == "installed":
+                    import importlib
+                    importlib.invalidate_caches()
+                    self.set_running(False)
+                    missing = tm.missing_packages()
+                    if payload == 0 and not missing:
+                        self.status_var.set("Packages installed. Press Start.")
+                        self.log("Packages installed.")
+                    else:
+                        self.status_var.set("Installing failed - see the Log tab")
+                        messagebox.showerror("Traffic Monitor", "Installing the packages failed. The Log tab "
+                                             "shows pip's output.\n\n" + tm.missing_message(
+                                                 "cactus" if "cactus-compute" in missing else "huggingface_hub"))
                 elif kind == "stopped":
                     self.set_running(False)
                     if not self.status_var.get().startswith("Stopped"):
@@ -504,7 +555,6 @@ class App:
         except queue.Empty:
             pass
         self.root.after(50, self.poll)
-        self.root.after(150, self._place_sashes)
 
     def refresh_video(self):
         with self.latest_lock:

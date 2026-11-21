@@ -799,12 +799,79 @@ class Monitor:
             reader.close()
 
 
+class MissingPackage(RuntimeError):
+    """A package this program needs is not installed in the running Python."""
+
+
+_PIP_NAMES = {"cactus": "cactus-compute", "PIL": "Pillow", "cv2": "opencv-python",
+              "huggingface_hub": "huggingface_hub", "numpy": "numpy"}
+
+
+def missing_message(module: str) -> str:
+    package = _PIP_NAMES.get((module or "").split(".")[0], module)
+    return (f"Python can't find the package '{package}'.\n\n"
+            f"The Python running this program is:\n{sys.executable}\n\n"
+            "In Visual Studio, open Solution Explorer > Python Environments. The environment "
+            "you created (env) must be the active one, shown in bold: right-click it > "
+            "Activate Environment. If it is missing, right-click Python Environments > "
+            "Add Environment... > Existing environment and pick the env folder. Then "
+            "right-click the environment > Install from requirements.txt, and run again.")
+
+
+def load_mirage():
+    """Return the cactus.Mirage class.
+
+    Uses the installed cactus-compute package, or else the cactus clone this
+    example lives in (two folders up), so it still runs when the package is
+    missing from the active Python environment.
+    """
+    try:
+        from cactus import Mirage
+        return Mirage
+    except ModuleNotFoundError as exc:
+        if exc.name != "cactus":
+            raise MissingPackage(missing_message(exc.name)) from exc
+    repo = Path(__file__).resolve().parents[2]
+    if (repo / "cactus" / "__init__.py").is_file():
+        if str(repo) not in sys.path:
+            sys.path.append(str(repo))
+        try:
+            from cactus import Mirage
+            return Mirage
+        except ModuleNotFoundError as exc:
+            raise MissingPackage(missing_message(exc.name or "cactus")) from exc
+    raise MissingPackage(missing_message("cactus"))
+
+
+def create_mirage(weights=None):
+    """Load Mirage, turning a missing package into a MissingPackage error."""
+    Mirage = load_mirage()
+    try:
+        return Mirage(weights=weights)
+    except ModuleNotFoundError as exc:  # e.g. huggingface_hub, needed to download
+        raise MissingPackage(missing_message(exc.name)) from exc
+
+
+def missing_packages():
+    """Packages the first Start will need but the running Python lacks."""
+    import importlib.util
+    missing = []
+    try:
+        load_mirage()
+    except MissingPackage:
+        missing.append("cactus-compute")
+    if importlib.util.find_spec("huggingface_hub") is None:
+        missing.append("huggingface_hub")
+    return missing
+
+
 def main(argv=None):
     args = parse_args(argv)
-    from cactus import Mirage
-
     print("loading Mirage (the first run downloads the engine and weights) ...")
-    vision = Mirage(weights=args.weights)
+    try:
+        vision = create_mirage(args.weights)
+    except MissingPackage as exc:
+        raise SystemExit(str(exc))
     window = {"ok": SHOW_WINDOW}
 
     def show(frame, active, stats):

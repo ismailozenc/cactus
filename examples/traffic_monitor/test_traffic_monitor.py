@@ -240,3 +240,13 @@ def test_gui_settings_file_round_trip(tmp_path, monkeypatch):
     assert (tm.APPROACH, tm.PLATE_FORMATS, tm.CROP_PASS, tm.OBJECT_CONF, tm.SOURCE) == \
         ("up", ("AA99AAA",), False, 0.4, "rtsp://x")
     assert tm.MAX_FPS == gui.DEFAULTS["MAX_FPS"]   # a bad saved value is ignored
+
+
+def test_missing_package_message_names_pip_package_and_python():
+    message = tm.missing_message("cactus")
+    assert "'cactus-compute'" in message and sys.executable in message
+    assert "'huggingface_hub'" in tm.missing_message("huggingface_hub")
+
+
+def test_mirage_loads_from_package_or_this_clone():
+    assert tm.load_mirage().__name__ == "Mirage"
