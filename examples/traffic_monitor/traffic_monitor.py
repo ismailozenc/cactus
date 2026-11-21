@@ -41,7 +41,7 @@ from pathlib import Path
 # ---------------------------------------------------------------- SETTINGS --
 
 # RTSP URL, a video file path, or a webcam number such as "0".
-SOURCE = "rtsp://user:password@192.168.1.64:554/Streams/Channels/101"
+SOURCE = "rtsp://127.0.0.1:8554/Streaming/Channels/101"
 
 # Which way a vehicle moves on screen when it is COMING towards the camera:
 # "down", "up", "left" or "right".
