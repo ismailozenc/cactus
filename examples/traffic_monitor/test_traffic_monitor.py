@@ -480,3 +480,64 @@ def test_live_video_runs_at_stream_rate_while_mirage_works_in_the_background(tmp
     assert any("coming" in dirs for _, dirs in shown)       # tracking still works from the frames Mirage saw
     rows = list(csv.DictReader(open(tmp_path / "events.csv", encoding="utf-8")))
     assert [r["direction"] for r in rows] == ["coming"]
+
+
+# ------------------------------------------------- a Mirage slower than 1 s --
+
+class CrawlingCarReader(FakeLiveReader):
+    """50 frames/s; a car creeping down 1 pixel per frame (50 px/s)."""
+
+    def read(self, last_seq, timeout=0.5):
+        time.sleep(0.02)
+        self.n += 1
+        y = 20 + self.n
+        return self.n, street([(100, y, 200, y + 60)])
+
+
+class OneSecondMirage(CountingMirage):
+    def describe(self, image, **kw):
+        time.sleep(1.0)
+        return super().describe(image, **kw)
+
+
+def test_boxes_stay_on_screen_and_one_track_when_mirage_takes_a_second(tmp_path, monkeypatch):
+    """The user's case: Mirage needs about a second per pass. Boxes used to
+    vanish (only vehicles seen in the last second were drawn) and every pass
+    started a new vehicle (the boxes no longer overlapped)."""
+    monkeypatch.setattr(tm, "LatestFrameReader", CrawlingCarReader)
+    monkeypatch.setattr(tm, "MAX_FPS", 0)
+    monkeypatch.setattr(tm, "CROP_PASS", False)
+    shown = []
+
+    def on_frame(frame, visible, stats, motion):
+        shown.append(([t.id for t in visible], stats["mirage_frames"], tm.mirage_status(stats)))
+        return len(shown) >= 230
+
+    tm.Monitor(OneSecondMirage(), "rtsp://camera", str(tmp_path), on_frame=on_frame, log=lambda m: None).run()
+    after_first = [ids for ids, passes, _ in shown if passes >= 1]
+    assert len(after_first) > 100
+    assert sum(1 for ids in after_first if ids) >= 0.95 * len(after_first)   # boxes on screen
+    assert {i for ids in after_first for i in ids} == {1}                       # one vehicle throughout
+    assert "s per pass" in shown[-1][2]
+    rows = list(csv.DictReader(open(tmp_path / "events.csv", encoding="utf-8")))
+    assert [r["direction"] for r in rows] == ["coming"]
+
+
+def test_tracker_matches_by_distance_and_speed():
+    tracker = tm.Tracker()
+    tracker.update([("car", None, (100, 100, 200, 160))], 1000, 1000, 0.0)
+    tracker.update([("car", None, (100, 180, 200, 240))], 1000, 1000, 1.0)   # no overlap: matched by distance
+    assert list(tracker.tracks) == [1] and tracker.tracks[1].velocity == (0.0, 80.0)
+    tracker.update([("car", None, (100, 260, 200, 320))], 1000, 1000, 2.0)   # predicted position overlaps
+    assert list(tracker.tracks) == [1]
+    tracker.update([("car", None, (700, 700, 800, 760))], 1000, 1000, 3.0)   # far away: a different car
+    assert sorted(tracker.tracks) == [1, 2]
+
+
+def test_next_car_in_the_queue_is_not_taken_for_the_one_ahead():
+    tracker = tm.Tracker()
+    tracker.update([("car", None, (100, 300, 200, 360))], 1000, 1000, 0.0)
+    tracker.update([("car", None, (100, 380, 200, 440))], 1000, 1000, 1.0)   # driving down at 80 px/s
+    # Car A is not detected; car B appears behind it (further up), within reach by distance.
+    tracker.update([("car", None, (100, 250, 200, 310))], 1000, 1000, 2.0)
+    assert sorted(tracker.tracks) == [1, 2]

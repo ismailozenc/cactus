@@ -125,9 +125,11 @@ TEXT_CONF = None
 
 # Tracker.
 IOU_MATCH = 0.25               # minimum overlap to continue a track
+MATCH_DISTANCE = 1.5           # else: furthest a vehicle may move between Mirage passes, in box sizes
 MAX_MISSED = 8                 # analysed frames a track may go unseen
-MAX_UNSEEN_SECONDS = 2.0       # a track outside the analysed area ends after this
-MIN_TRACK_FRAMES = 3           # shorter tracks are dropped as noise
+MAX_UNSEEN_SECONDS = 2.0       # a track outside the analysed area ends after this (at least
+                               # 3 Mirage passes, so a slow computer does not drop vehicles)
+MIN_TRACK_FRAMES = 2           # vehicles seen in fewer Mirage passes are dropped as noise
 DIRECTION_THRESHOLD = 0.08     # how much movement is needed to call a direction
 
 # Motion gate: a background image is learnt, and Mirage only looks where the
@@ -509,6 +511,12 @@ class Track:
     last_moved: float = 0.0
     ever_moved: bool = False
     last_crop: float = 0.0     # when it last had a second plate read
+    velocity: tuple = (0.0, 0.0)   # pixels per second, from the last two sightings
+
+    def predicted_box(self, now: float):
+        """Where the vehicle should be now if it kept its speed (at most 3 s ahead)."""
+        dt = min(3.0, max(0.0, now - self.last_seen))
+        return shift(self.box, round(self.velocity[0] * dt), round(self.velocity[1] * dt))
 
     def is_parked(self, now: float) -> bool:
         return now - self.last_moved >= PARKED_SECONDS
@@ -544,21 +552,50 @@ class Tracker:
         self.tracks: dict[int, Track] = {}
         self._next_id = 1
 
-    def update(self, detections, width: int, height: int, now: float, region=None):
+    def update(self, detections, width: int, height: int, now: float, region=None, unseen_limit=None):
         """Match detections to tracks. Returns (matched_tracks, finished_tracks).
 
         region is the part of the frame Mirage analysed: None for the whole
         frame, a box for a crop, or False when Mirage was skipped. A track
         outside it was not looked for, so instead of counting missed frames it
-        ends once unseen for MAX_UNSEEN_SECONDS.
+        ends once unseen for unseen_limit seconds (default MAX_UNSEEN_SECONDS).
         """
-        pairs = sorted(((iou(t.box, d[2]), tid, di)
-                        for tid, t in self.tracks.items() for di, d in enumerate(detections)),
+        limit = MAX_UNSEEN_SECONDS if unseen_limit is None else unseen_limit
+        predicted = {tid: t.predicted_box(now) for tid, t in self.tracks.items()}
+        pairs = sorted(((iou(predicted[tid], d[2]), tid, di)
+                        for tid in self.tracks for di, d in enumerate(detections)),
                        reverse=True)
         used_tracks, used_dets, matched = set(), set(), []
         for overlap, tid, di in pairs:
             if overlap < IOU_MATCH:
                 break
+            if tid in used_tracks or di in used_dets:
+                continue
+            used_tracks.add(tid)
+            used_dets.add(di)
+            matched.append((self.tracks[tid], detections[di]))
+        # When Mirage is slow a vehicle can move past its old box; match the
+        # rest by distance from where each vehicle was expected to be.
+        near = []
+        for tid, box in predicted.items():
+            if tid in used_tracks:
+                continue
+            size = max(box[2] - box[0], box[3] - box[1], 1)
+            track = self.tracks[tid]
+            last = centre(track.box)
+            for di, det in enumerate(detections):
+                if di not in used_dets:
+                    gap = math.dist(centre(box), centre(det[2])) / size
+                    if gap > MATCH_DISTANCE:
+                        continue
+                    # Never link a detection lying behind a moving vehicle: that is the
+                    # next car in the queue, not this one reversing.
+                    dx, dy = centre(det[2])[0] - last[0], centre(det[2])[1] - last[1]
+                    vx, vy = track.velocity
+                    if vx * dx + vy * dy < 0 and math.hypot(dx, dy) > 0.25 * size:
+                        continue
+                    near.append((gap, tid, di))
+        for gap, tid, di in sorted(near):
             if tid in used_tracks or di in used_dets:
                 continue
             used_tracks.add(tid)
@@ -571,6 +608,12 @@ class Tracker:
                 self.tracks[track.id] = track
                 matched.append((track, det))
         for track, (label, _, box) in matched:
+            if track.history and now > track.last_seen:
+                (ox, oy), (nx, ny) = centre(track.box), centre(box)
+                dt = now - track.last_seen
+                seen = ((nx - ox) / dt, (ny - oy) / dt)
+                track.velocity = tuple(0.5 * a + 0.5 * b for a, b in zip(track.velocity, seen)) \
+                    if track.velocity != (0.0, 0.0) else seen
             track.box, track.label, track.last_seen, track.missed = box, label, now, 0
             cx = (box[0] + box[2]) / 2 / width
             cy = (box[1] + box[3]) / 2 / height
@@ -588,7 +631,9 @@ class Tracker:
                 looked = region is None or (region is not False and contains_point(region, *centre(track.box)))
                 if looked:
                     track.missed += 1
-                if track.missed > MAX_MISSED or (not looked and now - track.last_seen > MAX_UNSEEN_SECONDS):
+                gone = now - track.last_seen > limit
+                # Not found MAX_MISSED times, or unseen too long (Mirage looked at least twice, or looked elsewhere).
+                if track.missed > MAX_MISSED or (gone and (not looked or track.missed >= 2)):
                     finished.append(self.tracks.pop(tid))
         return [t for t, _ in matched], finished
 
@@ -784,7 +829,7 @@ def crop(frame, box, pad: float):
     return crop_region(frame, box, pad)[0]
 
 
-def draw(frame, tracks, fps: float, motion: Motion = None, now: float = None, mirage_fps: float = None):
+def draw(frame, tracks, fps: float, motion: Motion = None, now: float = None, stats: dict = None):
     colours = {"coming": (0, 200, 0), "going": (0, 140, 255), "unknown": (200, 200, 200)}
     now = time.time() if now is None else now
     if SHOW_MOTION and motion is not None:
@@ -794,14 +839,19 @@ def draw(frame, tracks, fps: float, motion: Motion = None, now: float = None, mi
         if motion.region is not None:
             r = motion.region
             cv2.rectangle(frame, (r[0], r[1]), (r[2], r[3]), (0, 255, 255), 2)
-        cv2.putText(frame, f"Mirage: {motion.action} ({motion.reason})", (10, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame, f"motion: {motion.reason}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     for t in tracks:
-        direction = "parked" if t.is_parked(now) else t.direction()
+        parked = t.is_parked(now)
+        direction = "parked" if parked else t.direction()
         colour = colours.get(direction, (130, 130, 130))
-        x0, y0, x1, y1 = t.box
+        # Between Mirage passes, move the box on at the vehicle's speed so it keeps up with the car.
+        x0, y0, x1, y1 = t.box if parked else t.predicted_box(now)
+        x0, x1 = max(0, x0), min(frame.shape[1] - 1, x1)
+        y0, y1 = max(0, y0), min(frame.shape[0] - 1, y1)
+        if x1 <= x0 or y1 <= y0:
+            continue
         cv2.rectangle(frame, (x0, y0), (x1, y1), colour, 2)
-        if t.plate_box is not None:
+        if t.plate_box is not None and parked:
             p = t.plate_box
             cv2.rectangle(frame, (p[0], p[1]), (p[2], p[3]), (255, 255, 0), 1)
         plate = t.plate or "?"
@@ -811,10 +861,22 @@ def draw(frame, tracks, fps: float, motion: Motion = None, now: float = None, mi
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(frame, (x0, max(0, y0 - th - 8)), (x0 + tw + 6, y0), colour, -1)
         cv2.putText(frame, text, (x0 + 3, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-    rates = f"{fps:.1f} fps" + (f"  Mirage {mirage_fps:.1f}/s" if mirage_fps is not None else "")
-    cv2.putText(frame, f"{rates}  coming = {APPROACH}", (10, 25),
+    cv2.putText(frame, f"{fps:.1f} fps  coming = {APPROACH}", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    if stats is not None:
+        cv2.putText(frame, mirage_status(stats, now), (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return frame
+
+
+def mirage_status(stats: dict, now: float = None) -> str:
+    """'Mirage: 1.2 s per pass, last result 0.4 s ago' - shows it is making progress."""
+    now = time.time() if now is None else now
+    if not stats.get("mirage_frames"):
+        return "Mirage: waiting for the first result..."
+    text = f"Mirage: {stats['pass_seconds']:.1f} s per pass"
+    if stats.get("last_result"):
+        text += f", last result {max(0.0, now - stats['last_result']):.1f} s ago"
+    return text
 
 
 # -------------------------------------------------------------------- main --
@@ -952,7 +1014,9 @@ class Monitor:
         self.vision, self.source, self.output_dir = vision, source, output_dir
         self.on_frame, self.on_event, self.log = on_frame, on_event, log
         self.stats = {"processed": 0, "fps": 0.0, "vehicles": 0, "events": 0,
-                      "mirage_frames": 0, "mirage_fps": 0.0}
+                      "mirage_frames": 0, "mirage_fps": 0.0, "pass_seconds": 0.0, "last_result": None}
+        self._timing = {"passes": 0, "total": 0.0, "first": 0.0, "plate": 0.0, "plate_reads": 0,
+                        "objects": 0, "lines": 0}
         self.gate = MotionGate()
         self.tracker = Tracker()
         self.lock = threading.RLock()       # guards tracker, gate and the event log
@@ -973,16 +1037,23 @@ class Monitor:
                 if self.on_event:
                     self.on_event(row)
 
+    def unseen_limit(self) -> float:
+        """How long a vehicle may go unseen before it is closed: at least three
+        Mirage passes, so a slow computer does not lose vehicles between passes."""
+        return min(60.0, max(MAX_UNSEEN_SECONDS, 3 * self.stats["pass_seconds"]))
+
     # -- Mirage, on the worker thread --------------------------------------
 
     def _analyse(self, frame, motion, now):
         stats = self.stats
+        started = time.monotonic()
         height, width = frame.shape[:2]
         region = motion.region if motion.action == "crop" else None
         x0, y0 = (region[0], region[1]) if region else (0, 0)
         image = frame[region[1]:region[3], region[0]:region[2]] if region else frame
         rgb = np.ascontiguousarray(image[:, :, ::-1])  # OpenCV gives BGR
         result = self.vision.describe(rgb, **mirage_options(["objects", "text"]))
+        first_read = time.monotonic() - started
         stats["mirage_frames"] += 1
         if DUMP_JSON and stats["mirage_frames"] <= DUMP_JSON_FRAMES:
             self.log(json.dumps(result, ensure_ascii=False, indent=2)[:6000])
@@ -996,10 +1067,11 @@ class Monitor:
         with self.lock:
             if ignored:
                 self.gate.ignore = ignored   # the camera's clock is not motion
-            active, finished = self.tracker.update(vehicles, width, height, now, region=region)
+            limit = self.unseen_limit()
+            active, finished = self.tracker.update(vehicles, width, height, now, region=region, unseen_limit=limit)
             if motion.boxes:
                 # Spare any vehicle seen recently, even if Mirage missed it this frame.
-                recent = [t.box for t in self.tracker.tracks.values() if now - t.last_seen <= MAX_UNSEEN_SECONDS]
+                recent = [t.box for t in self.tracker.tracks.values() if now - t.last_seen <= limit]
                 empty = [b for b in motion.boxes if not any(area(overlap(b, r)) > 0 for r in recent)]
                 self.gate.absorb(empty, MOTION_FORGET_EMPTY)
             assign_plates(active, plate_boxes)
@@ -1015,17 +1087,41 @@ class Monitor:
                 chosen = min(wanting, key=lambda t: t.last_crop)
                 chosen.last_crop = now
             self._emit(finished)
+        plate_read = 0.0
         if chosen is not None:
+            plate_started = time.monotonic()
             read = crop_pass(self.vision, frame, chosen)
+            plate_read = time.monotonic() - plate_started
             with self.lock:
                 for text, box in read:
                     vote(chosen, text, box, ignored)
 
         done = time.monotonic()
-        if self._last_mirage is not None:
-            rate = 1.0 / max(done - self._last_mirage, 1e-6)
-            stats["mirage_fps"] = rate if stats["mirage_frames"] <= 2 else 0.8 * stats["mirage_fps"] + 0.2 * rate
-        self._last_mirage = done
+        took = done - started
+        stats["pass_seconds"] = took if stats["mirage_frames"] <= 1 else 0.8 * stats["pass_seconds"] + 0.2 * took
+        stats["mirage_fps"] = 1.0 / max(stats["pass_seconds"], 1e-6)
+        stats["last_result"] = time.time()
+        self._report_timing(took, first_read, plate_read if chosen is not None else None,
+                            len(objects), len(lines), "crop" if region else "whole frame")
+
+    def _report_timing(self, took, first_read, plate_read, objects, lines, what):
+        """Log where Mirage's time goes, every 20 passes, to guide tuning."""
+        t = self._timing
+        t["passes"] += 1
+        t["total"] += took
+        t["first"] += first_read
+        t["objects"] += objects
+        t["lines"] += lines
+        if plate_read is not None:
+            t["plate"] += plate_read
+            t["plate_reads"] += 1
+        if t["passes"] in (1, 5) or t["passes"] % 20 == 0:
+            n = t["passes"]
+            plate = (f", plate read {t['plate'] / t['plate_reads']:.2f} s on {t['plate_reads']} passes"
+                     if t["plate_reads"] else "")
+            self.log(f"Mirage timing over {n} passes: {t['total'] / n:.2f} s per pass "
+                     f"(first read {t['first'] / n:.2f} s{plate}); on average {t['objects'] / n:.1f} objects "
+                     f"and {t['lines'] / n:.1f} text lines per read; last pass read the {what}.")
 
     def _worker(self, stop, failures):
         while True:
@@ -1082,8 +1178,9 @@ class Monitor:
                 now = time.time()
                 with self.lock:
                     if MOTION_GATE:
+                        limit = self.unseen_limit()
                         protect = [t.box for t in tracker.tracks.values()
-                                   if now - t.last_seen < MAX_UNSEEN_SECONDS and not t.is_parked(now)]
+                                   if now - t.last_seen < limit and not t.is_parked(now)]
                         motion = self.gate.update(frame, now, protect)
                     else:
                         self.gate.reset()   # start afresh if the gate is switched back on
@@ -1094,15 +1191,13 @@ class Monitor:
                 if idle:
                     if motion.action == "skip":
                         with self.lock:
-                            _, finished = tracker.update([], width, height, now, region=False)
+                            _, finished = tracker.update([], width, height, now, region=False,
+                                                         unseen_limit=self.unseen_limit())
                             self._emit(finished)
                     else:
                         self._submit(frame, motion, now)
                         if not reader.is_live:
                             self._wait_idle(stop)   # a recording: analyse every frame in turn
-                elif motion.action != "skip":
-                    motion = Motion("busy", "Mirage busy with an earlier frame", mask=motion.mask,
-                                    boxes=motion.boxes)
 
                 stats["processed"] += 1
                 done = time.monotonic()
@@ -1113,7 +1208,8 @@ class Monitor:
                 fps = rate if stats["processed"] == 1 else 0.9 * fps + 0.1 * rate
                 with self.lock:
                     stats["fps"], stats["vehicles"] = fps, len(tracker.tracks)
-                    visible = [snapshot(t) for t in tracker.tracks.values() if now - t.last_seen <= 1.0]
+                    # Every vehicle still being followed, at the place Mirage last saw it.
+                    visible = [snapshot(t) for t in tracker.tracks.values()]
                 if self.on_frame and self.on_frame(frame, visible, dict(stats), motion):
                     break
                 min_interval = 1.0 / MAX_FPS if MAX_FPS > 0 else 0.0
@@ -1217,7 +1313,7 @@ def main(argv=None):
         if window["ok"]:
             try:
                 cv2.imshow("Traffic monitor (Q to quit)",
-                           draw(frame.copy(), active, stats["fps"], motion, mirage_fps=stats["mirage_fps"]))
+                           draw(frame.copy(), active, stats["fps"], motion, stats=stats))
                 return cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27)
             except cv2.error:
                 print("no display available; continuing without the preview window")

@@ -56,10 +56,20 @@ is published) and the Mirage weights from Hugging Face, then caches them.
 * **Video speed:** for a camera, the video, the motion check and the overlay
   run at the stream's rate (up to **Output > Max video frames per second**,
   20 by default). Mirage runs alongside on the newest frame whenever it is
-  free. The status bar shows both rates, for example "video 20 fps, Mirage
-  1.5/s". Boxes follow the last frame Mirage finished, so they can trail a
-  fast car slightly. A video file is analysed frame by frame instead, so a
-  recording always gives the same result.
+  free. The overlay and status bar show how long a Mirage pass takes and
+  how long ago the last result came in, for example "Mirage: 1.2 s per pass,
+  last result 0.4 s ago". Between passes each box is moved on at its
+  vehicle's speed. Every vehicle still being followed is drawn, however slow
+  Mirage is. The Log tab reports where Mirage's time goes (first read, plate
+  read, objects per read) after 1, 5 and every 20 passes. A video file is
+  analysed frame by frame instead, so a recording always gives the same
+  result.
+* **When Mirage is slow** (about a second per pass or more), a car moves a
+  long way between passes. Vehicles are then matched by distance from where
+  they should be (**Direction > Max move between passes**), but never to a
+  detection behind them, which would be the next car in a queue. Time limits
+  stretch to at least three passes, and a vehicle seen in two passes is
+  enough to log.
 * **Vehicles** at the bottom lists each vehicle when it leaves the picture:
   green for coming, orange for going. Double-click a row to open its
   snapshot. **Log** shows status messages and, if switched on under

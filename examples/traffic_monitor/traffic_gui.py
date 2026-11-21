@@ -48,6 +48,7 @@ OLD_DEFAULTS = {
     "PLATE_REGEX": [r"^(?=.*[0-9])(?=.*[A-Z])[A-Z0-9]{4,9}$"],
     "MAX_FPS": [10.0],
     "CROP_EVERY": [2],
+    "MIN_TRACK_FRAMES": [3],
 }
 
 # (setting, kind, label, help, extra). Kinds: choice, int, float, optfloat
@@ -60,9 +61,13 @@ SETTINGS = {
          "coming or going. Raise it if parked cars get a direction, lower it if moving cars stay 'unknown'.", (0.0, 1.0, 0.01)),
         ("IOU_MATCH", "float", "Box overlap to follow", "How much a box must overlap the last one to count as the same "
          "vehicle. Lower it for fast traffic or a low frame rate.", (0.05, 0.95, 0.05)),
+        ("MATCH_DISTANCE", "float", "Max move between passes", "How far (in box sizes) a vehicle may move between "
+         "two Mirage passes and still count as the same vehicle, when the boxes no longer overlap. Raise it if "
+         "Mirage is slow and cars get new numbers as they drive.", (0.0, 10.0, 0.25)),
         ("MAX_MISSED", "int", "Frames before a car is gone", "Frames a vehicle may go undetected before it is logged and "
          "forgotten.", (1, 500)),
-        ("MIN_TRACK_FRAMES", "int", "Shortest track to log", "Vehicles seen in fewer frames than this are treated as noise.",
+        ("MIN_TRACK_FRAMES", "int", "Shortest track to log", "Vehicles seen in fewer Mirage passes than this are "
+         "treated as noise. Keep it low if Mirage is slow (see the seconds per pass in the status bar).",
          (1, 500)),
         ("MAX_UNSEEN_SECONDS", "float", "Forget after (s) unseen", "With the motion gate, a vehicle outside the area "
          "Mirage reads is logged and forgotten after this long.", (0.2, 600, 0.5)),
@@ -562,7 +567,7 @@ class App:
             post("status", "Connecting...")
 
             def on_frame(frame, visible, stats, motion):
-                annotated = tm.draw(frame.copy(), visible, stats["fps"], motion, mirage_fps=stats["mirage_fps"])
+                annotated = tm.draw(frame.copy(), visible, stats["fps"], motion, stats=stats)
                 with self.latest_lock:
                     self.latest = annotated
                 post("stats", stats)
@@ -594,10 +599,10 @@ class App:
                     self.log(payload)
                 elif kind == "stats":
                     share = payload["mirage_frames"] / max(1, payload["processed"])
-                    self.status_var.set(f"Running  \u2022  video {payload['fps']:.1f} fps  \u2022  Mirage "
-                                        f"{payload['mirage_fps']:.1f}/s on {share:.0%} of frames  \u2022  "
-                                        f"{payload['vehicles']} vehicles in view  \u2022  "
-                                        f"{payload['events']} logged")
+                    self.status_var.set(f"Running  \u2022  video {payload['fps']:.1f} fps  \u2022  "
+                                        f"{tm.mirage_status(payload)}, {payload['mirage_frames']} passes on "
+                                        f"{share:.0%} of frames  \u2022  {payload['vehicles']} vehicles in view  "
+                                        f"\u2022  {payload['events']} logged")
                 elif kind == "event":
                     self.add_event(payload)
                 elif kind == "error":
