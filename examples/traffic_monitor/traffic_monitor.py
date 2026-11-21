@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import itertools
 import json
 import math
 import os
@@ -44,7 +45,7 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -101,14 +102,20 @@ IGNORE_TEXT_IN = ("watermark", "timestamp", "logo")
 PLATE_FORMATS = ()
 PLATE_MAX_FIXES = 3            # most characters a layout may correct in one read
 
-# Used when PLATE_FORMATS is empty: the plate after cleaning. The default
-# accepts 4 to 9 characters with at least one digit and one letter.
-PLATE_REGEX = r"^(?=.*[0-9])(?=.*[A-Z])[A-Z0-9]{4,9}$"
+# Used when PLATE_FORMATS is empty: the plate after cleaning (uppercase,
+# letters, digits and Ä Ö Ü only). Ready-made patterns:
+#   GERMAN_PLATE_REGEX: district (1-3 letters), 1-2 letters, 1-4 digits not
+#     starting with 0, then E (electric) or H (historic) optionally; at most
+#     8 characters before the E/H. "SB-FN 79E" is read as SBFN79E.
+#   ANY_PLATE_REGEX: 4 to 9 characters with at least one digit and one letter.
+GERMAN_PLATE_REGEX = r"^(?=[A-ZÄÖÜ0-9]{3,8}[EH]?$)[A-ZÄÖÜ]{1,3}[A-Z]{1,2}[1-9][0-9]{0,3}[EH]?$"
+ANY_PLATE_REGEX = r"^(?=.*[0-9])(?=.*[A-ZÄÖÜ])[A-ZÄÖÜ0-9]{4,9}$"
+PLATE_REGEX = GERMAN_PLATE_REGEX
 PLATE_CONFIRM_VOTES = 3        # identical reads needed before a plate is final
 
 # Extra plate pass on a full-resolution crop of each unconfirmed vehicle.
 CROP_PASS = True
-CROP_EVERY = 2                 # only every Nth processed frame
+CROP_EVERY = 1                 # only on every Nth Mirage pass (one vehicle per pass)
 CROP_MIN_WIDTH = 120           # skip vehicles narrower than this (pixels)
 CROP_PAD = 0.06                # grow the crop by this fraction on each side
 
@@ -135,6 +142,7 @@ MOTION_MIN_CROP = 0.3          # smallest crop sent to Mirage, as a share of the
 MOTION_FULL_FRAME = 0.6        # send the whole frame when motion covers more than this
 MOTION_LEARN_SECONDS = 10.0    # how fast the background absorbs changes
 MOTION_RESET_FRACTION = 0.7    # this much of the frame changing at once resets the background
+MOTION_EXPOSURE = True         # cancel whole-frame brightness changes (auto exposure, clouds)
 # Moving areas where Mirage then finds no vehicle (a "ghost" left by a car that
 # was there when the background was learnt, a door, a shadow) fade into the
 # background this much per frame instead of slowly. Areas touching any vehicle
@@ -148,7 +156,7 @@ PARKED_SECONDS = 20.0
 PARKED_MOVE = 0.03             # movement below this share of the frame does not count
 LOG_PARKED = False
 
-MAX_FPS = 10.0                 # cap on processed frames per second
+MAX_FPS = 20.0                 # cap on video frames per second (Mirage runs as fast as it can)
 SHOW_WINDOW = True             # live preview window (press Q or Esc to stop)
 OUTPUT_DIR = "traffic_output"
 SAVE_SNAPSHOTS = True
@@ -388,7 +396,21 @@ _TO_LETTER = {"0": "O", "1": "I", "2": "Z", "4": "A", "5": "S", "6": "G", "7": "
 
 
 def clean_plate(text: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", text.upper())
+    return re.sub(r"[^A-Z0-9ÄÖÜ]", "", text.upper())
+
+
+_LOOKALIKE = str.maketrans("OQDILZSBGT", "0001125861")
+
+
+def is_ignored_text(cleaned: str) -> bool:
+    """True if cleaned is, or looks like, an IGNORE_TEXT entry (CAMERA01, CAMERAO1, CAMERA0I...)."""
+    shape = cleaned.translate(_LOOKALIKE)
+    for entry in IGNORE_TEXT:
+        target = clean_plate(entry).translate(_LOOKALIKE)
+        if target and (shape == target or (len(target) >= 5 and (target in shape or
+                                                                  (len(shape) >= 5 and shape in target)))):
+            return True
+    return False
 
 
 def fit_format(cleaned: str, layout: str):
@@ -439,21 +461,25 @@ def _fit_formats(cleaned: str):
 def plate_candidates(text: str):
     """Plates that text may contain, best guess first."""
     cleaned = clean_plate(text)
-    if not cleaned or cleaned in {clean_plate(t) for t in IGNORE_TEXT}:
+    if not cleaned or is_ignored_text(cleaned):
         return []
     if PLATE_FORMATS:
         return _fit_formats(cleaned)
     if re.match(PLATE_REGEX, cleaned):
         return [cleaned]
-    # Try fixing one ambiguous character at a time, but only for text that
-    # already mixes letters and digits, so signs such as "STOP" stay out.
-    if not (re.search(r"[0-9]", cleaned) and re.search(r"[A-Z]", cleaned)):
+    # Try swapping look-alike characters (fewest swaps first, at most
+    # PLATE_MAX_FIXES), but only for text that already mixes letters and
+    # digits, so signs such as "STOP" stay out.
+    if not (re.search(r"[0-9]", cleaned) and re.search(r"[A-ZÄÖÜ]", cleaned)):
         return []
-    for i, ch in enumerate(cleaned):
-        if ch in _AMBIGUOUS:
-            fixed = cleaned[:i] + _AMBIGUOUS[ch] + cleaned[i + 1:]
-            if re.match(PLATE_REGEX, fixed):
-                return [fixed]
+    spots = [i for i, ch in enumerate(cleaned) if ch in _AMBIGUOUS]
+    for count in range(1, min(PLATE_MAX_FIXES, len(spots)) + 1):
+        for chosen in itertools.combinations(spots, count):
+            fixed = list(cleaned)
+            for i in chosen:
+                fixed[i] = _AMBIGUOUS[fixed[i]]
+            if re.match(PLATE_REGEX, "".join(fixed)):
+                return ["".join(fixed)]
     return []
 
 
@@ -482,6 +508,7 @@ class Track:
     anchor: object = None      # where it was when it last moved (normalised centre)
     last_moved: float = 0.0
     ever_moved: bool = False
+    last_crop: float = 0.0     # when it last had a second plate read
 
     def is_parked(self, now: float) -> bool:
         return now - self.last_moved >= PARKED_SECONDS
@@ -625,7 +652,13 @@ class MotionGate:
             self.background, self.last_time = grey, now
             return Motion("full", "learning the background")
 
-        mask = (cv2.absdiff(grey, self.background) > MOTION_THRESHOLD).astype(np.uint8) * 255
+        background = self.background
+        if MOTION_EXPOSURE:
+            # Auto exposure and clouds scale the whole picture; undo that before comparing.
+            # The median ratio ignores the few pixels that really changed.
+            gain = float(np.median((grey[::4, ::4] + 1.0) / (background[::4, ::4] + 1.0)))
+            background = background * min(2.0, max(0.5, gain))
+        mask = (cv2.absdiff(grey, background) > MOTION_THRESHOLD).astype(np.uint8) * 255
         if cv2.countNonZero(mask) > MOTION_RESET_FRACTION * mask.size:
             self.background, self.last_time = grey, now   # lights, day/night switch, camera moved
             return Motion("full", "scene changed, background reset", mask=mask)
@@ -751,7 +784,7 @@ def crop(frame, box, pad: float):
     return crop_region(frame, box, pad)[0]
 
 
-def draw(frame, tracks, fps: float, motion: Motion = None, now: float = None):
+def draw(frame, tracks, fps: float, motion: Motion = None, now: float = None, mirage_fps: float = None):
     colours = {"coming": (0, 200, 0), "going": (0, 140, 255), "unknown": (200, 200, 200)}
     now = time.time() if now is None else now
     if SHOW_MOTION and motion is not None:
@@ -778,7 +811,8 @@ def draw(frame, tracks, fps: float, motion: Motion = None, now: float = None):
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(frame, (x0, max(0, y0 - th - 8)), (x0 + tw + 6, y0), colour, -1)
         cv2.putText(frame, text, (x0 + 3, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-    cv2.putText(frame, f"{fps:.1f} fps  coming = {APPROACH}", (10, 25),
+    rates = f"{fps:.1f} fps" + (f"  Mirage {mirage_fps:.1f}/s" if mirage_fps is not None else "")
+    cv2.putText(frame, f"{rates}  coming = {APPROACH}", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return frame
 
@@ -839,22 +873,23 @@ def assign_text(tracks, lines, ignored=()):
             vote(owner, text, box, ignored)
 
 
-def crop_pass(vision, frame, track, ignored):
-    """Read the plate (or the whole vehicle) again at full resolution."""
+def crop_pass(vision, frame, track):
+    """Read the plate (or the whole vehicle) again at full resolution.
+
+    Returns [(text, box_in_frame_pixels_or_None), ...] for the caller to vote with.
+    """
     if track.plate_box is not None and track.plate_box[2] - track.plate_box[0] >= PLATE_CROP_MIN_WIDTH:
         box, pad = track.plate_box, PLATE_CROP_PAD
     elif track.box[2] - track.box[0] >= CROP_MIN_WIDTH:
         box, pad = track.box, CROP_PAD
     else:
-        return
+        return []
     piece, (ox, oy) = crop_region(frame, box, pad)
     if piece.size == 0:
-        return
+        return []
     result = vision.describe(np.ascontiguousarray(piece[:, :, ::-1]), **mirage_options(["text"]))
-    for text, tbox in parse_text(result, piece.shape[1], piece.shape[0]):
-        if tbox is not None:
-            tbox = (tbox[0] + ox, tbox[1] + oy, tbox[2] + ox, tbox[3] + oy)
-        vote(track, text, tbox, ignored)
+    return [(text, shift(tbox, ox, oy) if tbox is not None else None)
+            for text, tbox in parse_text(result, piece.shape[1], piece.shape[0])]
 
 
 def parse_args(argv=None):
@@ -902,6 +937,12 @@ class Monitor:
     Settings are read from this module's globals on every frame, so changing
     one (for example ``traffic_monitor.APPROACH = "up"``) applies while it runs.
 
+    For a live stream, reading frames, the motion gate and on_frame run at the
+    stream's rate (up to MAX_FPS) while Mirage runs on a worker thread, taking
+    the newest frame whenever it is free. The video stays smooth however slow
+    Mirage is. A video file is analysed frame by frame instead, so a recording
+    gives the same result every time.
+
     on_frame(frame_bgr, visible_tracks, stats, motion) is called after every
     frame; return True from it to stop. on_event(row) is called for every row
     written to events.csv, and log(message) for status messages.
@@ -910,29 +951,126 @@ class Monitor:
     def __init__(self, vision, source, output_dir, on_frame=None, on_event=None, log=print):
         self.vision, self.source, self.output_dir = vision, source, output_dir
         self.on_frame, self.on_event, self.log = on_frame, on_event, log
-        self.stats = {"processed": 0, "fps": 0.0, "vehicles": 0, "events": 0, "mirage_frames": 0}
+        self.stats = {"processed": 0, "fps": 0.0, "vehicles": 0, "events": 0,
+                      "mirage_frames": 0, "mirage_fps": 0.0}
         self.gate = MotionGate()
+        self.tracker = Tracker()
+        self.lock = threading.RLock()       # guards tracker, gate and the event log
+        self._events = None
+        self._job = None
+        self._busy = False
+        self._wake = threading.Condition()
+        self._last_mirage = None
+
+    # -- events ------------------------------------------------------------
+
+    def _emit(self, finished):
+        for track in finished:
+            row = self._events.write(track)
+            if row is not None:
+                self.stats["events"] += 1
+                self.log(format_event(row))
+                if self.on_event:
+                    self.on_event(row)
+
+    # -- Mirage, on the worker thread --------------------------------------
+
+    def _analyse(self, frame, motion, now):
+        stats = self.stats
+        height, width = frame.shape[:2]
+        region = motion.region if motion.action == "crop" else None
+        x0, y0 = (region[0], region[1]) if region else (0, 0)
+        image = frame[region[1]:region[3], region[0]:region[2]] if region else frame
+        rgb = np.ascontiguousarray(image[:, :, ::-1])  # OpenCV gives BGR
+        result = self.vision.describe(rgb, **mirage_options(["objects", "text"]))
+        stats["mirage_frames"] += 1
+        if DUMP_JSON and stats["mirage_frames"] <= DUMP_JSON_FRAMES:
+            self.log(json.dumps(result, ensure_ascii=False, indent=2)[:6000])
+        ih, iw = image.shape[:2]
+        objects = [(label, score, shift(box, x0, y0)) for label, score, box in parse_objects(result, iw, ih)]
+        lines = [(text, shift(box, x0, y0) if box else None) for text, box in parse_text(result, iw, ih)]
+        vehicles, plate_boxes, ignored = split_objects(objects)
+        if region:   # half a parked car at the crop border is not a moving vehicle
+            vehicles = [v for v in vehicles if not cut_by_crop(v[2], region, width, height)]
+
+        with self.lock:
+            if ignored:
+                self.gate.ignore = ignored   # the camera's clock is not motion
+            active, finished = self.tracker.update(vehicles, width, height, now, region=region)
+            if motion.boxes:
+                # Spare any vehicle seen recently, even if Mirage missed it this frame.
+                recent = [t.box for t in self.tracker.tracks.values() if now - t.last_seen <= MAX_UNSEEN_SECONDS]
+                empty = [b for b in motion.boxes if not any(area(overlap(b, r)) > 0 for r in recent)]
+                self.gate.absorb(empty, MOTION_FORGET_EMPTY)
+            assign_plates(active, plate_boxes)
+            assign_text(active, lines, ignored)
+            for track in active:
+                size = area(track.box)
+                if SAVE_SNAPSHOTS and size > track.best_area:
+                    track.best_area, track.best_snapshot = size, crop(frame, track.box, CROP_PAD).copy()
+            # One second read per Mirage pass at most, to the vehicle that waited longest.
+            wanting = [t for t in active if not t.plate_confirmed and not t.is_parked(now)]
+            chosen = None
+            if CROP_PASS and wanting and stats["mirage_frames"] % max(1, CROP_EVERY) == 0:
+                chosen = min(wanting, key=lambda t: t.last_crop)
+                chosen.last_crop = now
+            self._emit(finished)
+        if chosen is not None:
+            read = crop_pass(self.vision, frame, chosen)
+            with self.lock:
+                for text, box in read:
+                    vote(chosen, text, box, ignored)
+
+        done = time.monotonic()
+        if self._last_mirage is not None:
+            rate = 1.0 / max(done - self._last_mirage, 1e-6)
+            stats["mirage_fps"] = rate if stats["mirage_frames"] <= 2 else 0.8 * stats["mirage_fps"] + 0.2 * rate
+        self._last_mirage = done
+
+    def _worker(self, stop, failures):
+        while True:
+            with self._wake:
+                while self._job is None and not stop.is_set():
+                    self._wake.wait(0.2)
+                if self._job is None:
+                    return
+                job, self._job = self._job, None
+            try:
+                self._analyse(*job)
+            except BaseException as exc:  # report it on the main thread
+                failures.append(exc)
+                stop.set()
+            finally:
+                with self._wake:
+                    self._busy = False
+                    self._wake.notify_all()
+
+    def _submit(self, frame, motion, now):
+        with self._wake:
+            self._busy = True
+            self._job = (frame, motion, now)
+            self._wake.notify_all()
+
+    def _wait_idle(self, stop):
+        with self._wake:
+            while self._busy and not stop.is_set():
+                self._wake.wait(0.2)
+
+    # -- main loop ---------------------------------------------------------
 
     def run(self, stop: threading.Event = None):
         stop = stop or threading.Event()
         self.log(f"opening {redact(str(self.source))}")
         reader = LatestFrameReader(str(self.source), log=self.log)
-        tracker, events = Tracker(), EventLog(self.output_dir)
-        self.log(f"logging to {events.path.resolve()}")
+        self._events = EventLog(self.output_dir)
+        self.log(f"logging to {self._events.path.resolve()}")
+        stats, tracker = self.stats, self.tracker
         seq, fps, last_done = 0, 0.0, None
-        stats = self.stats
-
-        def emit(finished):
-            for track in finished:
-                row = events.write(track)
-                if row is not None:
-                    stats["events"] += 1
-                    self.log(format_event(row))
-                    if self.on_event:
-                        self.on_event(row)
-
+        worker_stop, failures = threading.Event(), []
+        worker = threading.Thread(target=self._worker, args=(worker_stop, failures), daemon=True)
+        worker.start()
         try:
-            while not stop.is_set():
+            while not stop.is_set() and not failures:
                 started = time.monotonic()
                 seq, frame = reader.read(seq, timeout=0.5)
                 if frame is None:
@@ -942,51 +1080,29 @@ class Monitor:
                     break
                 height, width = frame.shape[:2]
                 now = time.time()
-                if MOTION_GATE:
-                    protect = [t.box for t in tracker.tracks.values()
-                               if now - t.last_seen < MAX_UNSEEN_SECONDS and not t.is_parked(now)]
-                    motion = self.gate.update(frame, now, protect)
-                else:
-                    self.gate.reset()   # start afresh if the gate is switched back on
-                    motion = Motion("full", "motion gate off")
+                with self.lock:
+                    if MOTION_GATE:
+                        protect = [t.box for t in tracker.tracks.values()
+                                   if now - t.last_seen < MAX_UNSEEN_SECONDS and not t.is_parked(now)]
+                        motion = self.gate.update(frame, now, protect)
+                    else:
+                        self.gate.reset()   # start afresh if the gate is switched back on
+                        motion = Motion("full", "motion gate off")
 
-                if motion.action == "skip":
-                    active, finished = tracker.update([], width, height, now, region=False)
-                else:
-                    region = motion.region if motion.action == "crop" else None
-                    x0, y0 = (region[0], region[1]) if region else (0, 0)
-                    image = frame[region[1]:region[3], region[0]:region[2]] if region else frame
-                    rgb = np.ascontiguousarray(image[:, :, ::-1])  # OpenCV gives BGR
-                    result = self.vision.describe(rgb, **mirage_options(["objects", "text"]))
-                    stats["mirage_frames"] += 1
-                    if DUMP_JSON and stats["mirage_frames"] <= DUMP_JSON_FRAMES:
-                        self.log(json.dumps(result, ensure_ascii=False, indent=2)[:6000])
-                    ih, iw = image.shape[:2]
-                    objects = [(label, score, shift(box, x0, y0))
-                               for label, score, box in parse_objects(result, iw, ih)]
-                    lines = [(text, shift(box, x0, y0) if box else None) for text, box in parse_text(result, iw, ih)]
-                    vehicles, plate_boxes, ignored = split_objects(objects)
-                    if region:   # half a parked car at the crop border is not a moving vehicle
-                        vehicles = [v for v in vehicles if not cut_by_crop(v[2], region, width, height)]
-                    if ignored:
-                        self.gate.ignore = ignored   # the camera's clock is not motion
-                    active, finished = tracker.update(vehicles, width, height, now, region=region)
-                    if motion.boxes:
-                        # Spare any vehicle seen recently, even if Mirage missed it this frame.
-                        recent = [t.box for t in tracker.tracks.values()
-                                  if now - t.last_seen <= MAX_UNSEEN_SECONDS]
-                        empty = [b for b in motion.boxes if not any(area(overlap(b, r)) > 0 for r in recent)]
-                        self.gate.absorb(empty, MOTION_FORGET_EMPTY)
-                    assign_plates(active, plate_boxes)
-                    assign_text(active, lines, ignored)
-                    for track in active:
-                        size = area(track.box)
-                        if SAVE_SNAPSHOTS and size > track.best_area:
-                            track.best_area, track.best_snapshot = size, crop(frame, track.box, CROP_PAD).copy()
-                        if (CROP_PASS and not track.plate_confirmed and not track.is_parked(now)
-                                and stats["processed"] % max(1, CROP_EVERY) == 0):
-                            crop_pass(self.vision, frame, track, ignored)
-                emit(finished)
+                with self._wake:
+                    idle = not self._busy
+                if idle:
+                    if motion.action == "skip":
+                        with self.lock:
+                            _, finished = tracker.update([], width, height, now, region=False)
+                            self._emit(finished)
+                    else:
+                        self._submit(frame, motion, now)
+                        if not reader.is_live:
+                            self._wait_idle(stop)   # a recording: analyse every frame in turn
+                elif motion.action != "skip":
+                    motion = Motion("busy", "Mirage busy with an earlier frame", mask=motion.mask,
+                                    boxes=motion.boxes)
 
                 stats["processed"] += 1
                 done = time.monotonic()
@@ -995,18 +1111,31 @@ class Monitor:
                 rate = 1.0 / max(done - (last_done or started), 1e-6)
                 last_done = done
                 fps = rate if stats["processed"] == 1 else 0.9 * fps + 0.1 * rate
-                stats["fps"], stats["vehicles"] = fps, len(tracker.tracks)
-
-                visible = [t for t in tracker.tracks.values() if now - t.last_seen <= 1.0]
+                with self.lock:
+                    stats["fps"], stats["vehicles"] = fps, len(tracker.tracks)
+                    visible = [snapshot(t) for t in tracker.tracks.values() if now - t.last_seen <= 1.0]
                 if self.on_frame and self.on_frame(frame, visible, dict(stats), motion):
                     break
                 min_interval = 1.0 / MAX_FPS if MAX_FPS > 0 else 0.0
                 if min_interval > elapsed:
                     stop.wait(min_interval - elapsed)
+            if failures:
+                raise failures[0]
         finally:
-            emit(tracker.flush())
-            events.close()
+            worker_stop.set()
+            with self._wake:
+                self._wake.notify_all()
+            worker.join(timeout=30)
+            with self.lock:
+                self._emit(tracker.flush())
+                self._events.close()
             reader.close()
+
+
+def snapshot(track):
+    """A copy of a track that is safe to draw while the worker updates the original."""
+    ends = track.history[:1] + track.history[-1:] if len(track.history) > 1 else list(track.history)
+    return replace(track, history=ends, plate_votes=collections.Counter(track.plate_votes))
 
 
 class MissingPackage(RuntimeError):
@@ -1087,7 +1216,8 @@ def main(argv=None):
     def show(frame, active, stats, motion):
         if window["ok"]:
             try:
-                cv2.imshow("Traffic monitor (Q to quit)", draw(frame.copy(), active, stats["fps"], motion))
+                cv2.imshow("Traffic monitor (Q to quit)",
+                           draw(frame.copy(), active, stats["fps"], motion, mirage_fps=stats["mirage_fps"]))
                 return cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27)
             except cv2.error:
                 print("no display available; continuing without the preview window")

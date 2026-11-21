@@ -7,6 +7,7 @@ video, so these run without the engine, the weights or a camera:
 """
 import csv
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -23,6 +24,7 @@ def defaults(monkeypatch):
     monkeypatch.setattr(tm, "APPROACH", "down")
     monkeypatch.setattr(tm, "BBOX_ORDER", "xyxy")
     monkeypatch.setattr(tm, "SHOW_WINDOW", False)
+    monkeypatch.setattr(tm, "PLATE_REGEX", tm.ANY_PLATE_REGEX)   # tests below use "34 ABC 123"
 
 
 def test_boxes_scale_order_and_clamp(monkeypatch):
@@ -235,7 +237,7 @@ def test_gui_settings_file_round_trip(tmp_path, monkeypatch):
     gui.save_settings()
     for name in ("APPROACH", "PLATE_FORMATS", "CROP_PASS", "OBJECT_CONF", "SOURCE"):
         monkeypatch.setattr(tm, name, gui.DEFAULTS[name])
-    (tmp_path / "s.json").write_text((tmp_path / "s.json").read_text().replace('"MAX_FPS": 10.0', '"MAX_FPS": "bad"'))
+    (tmp_path / "s.json").write_text((tmp_path / "s.json").read_text().replace('"MAX_FPS": 20.0', '"MAX_FPS": "bad"'))
     gui.load_settings()
     assert (tm.APPROACH, tm.PLATE_FORMATS, tm.CROP_PASS, tm.OBJECT_CONF, tm.SOURCE) == \
         ("up", ("AA99AAA",), False, 0.4, "rtsp://x")
@@ -391,3 +393,90 @@ def test_ghost_of_a_departed_car_fades_once_mirage_finds_nothing(monkeypatch):
         gate.absorb(motion.boxes, 0.5)                          # Mirage found no vehicle there
         motion = gate.update(street(), t / 10)
     assert motion.action == "skip"
+
+
+# --------------------------------------------------- German plates, ignore --
+
+@pytest.mark.parametrize("read,plate", [
+    ("SB-FN 79E", "SBFN79E"), ("M AB 1234", "MAB1234"), ("B A 1", "BA1"), ("HH AB 123H", "HHAB123H"),
+    ("MÜ X 99", "MÜX99"), ("5B FN 79E", "SBFN79E"), ("SB FN 7SE", "SBFN75E"), ("SB FN 79", "SBFN79"),
+])
+def test_german_plates(monkeypatch, read, plate):
+    monkeypatch.setattr(tm, "PLATE_REGEX", tm.GERMAN_PLATE_REGEX)
+    assert tm.plate_candidates(read) == [plate]
+
+
+# (Look-alike fixing can still turn a fragment such as "Z66E" into a valid
+# German plate, ZG6E; votes across frames are what outweigh such reads.)
+@pytest.mark.parametrize("read", ["ABC DE 12345", "34 ABC 123", "CAMERA01", "STOP", "MYPARKEN", "1234", "AB-CD"])
+def test_not_german_plates(monkeypatch, read):
+    monkeypatch.setattr(tm, "PLATE_REGEX", tm.GERMAN_PLATE_REGEX)
+    assert tm.plate_candidates(read) == []
+
+
+def test_german_is_the_default():
+    import importlib
+    fresh = importlib.reload(tm)
+    assert fresh.PLATE_REGEX == fresh.GERMAN_PLATE_REGEX and fresh.MAX_FPS == 20.0
+
+
+@pytest.mark.parametrize("read", ["Camera 01", "CAMERAO1", "CAMERA0I", "Camera01 10:42"])
+def test_camera_name_lookalikes_are_ignored(read):
+    assert tm.plate_candidates(read) == []
+
+
+def test_brightness_change_of_the_whole_picture_is_not_motion(monkeypatch):
+    scene = street()
+    cv2.rectangle(scene, (300, 100), (500, 300), (150, 150, 150), -1)
+    brighter = np.clip(scene.astype(np.float32) * 1.5, 0, 255).astype(np.uint8)
+    gate = tm.MotionGate()
+    gate.update(scene, 0.0)
+    assert gate.update(brighter, 0.1).action == "skip"
+    monkeypatch.setattr(tm, "MOTION_EXPOSURE", False)
+    gate = tm.MotionGate()
+    gate.update(scene, 0.0)
+    assert gate.update(brighter, 0.1).action == "full"          # without it: everything "moved"
+
+
+class FakeLiveReader:
+    """Stands in for an RTSP stream: 50 frames/s of a car driving down."""
+    frames = 0
+
+    def __init__(self, source, log=None):
+        self.is_live = True
+        self.n = 0
+
+    def read(self, last_seq, timeout=0.5):
+        time.sleep(0.02)
+        self.n += 1
+        i = min(self.n, 60)
+        y = 20 + 4 * i
+        return self.n, street([(100, y, 200, y + 60)])
+
+    def close(self):
+        pass
+
+
+class SlowMirage(CountingMirage):
+    def describe(self, image, **kw):
+        time.sleep(0.08)                      # Mirage much slower than the stream
+        return super().describe(image, **kw)
+
+
+def test_live_video_runs_at_stream_rate_while_mirage_works_in_the_background(tmp_path, monkeypatch):
+    monkeypatch.setattr(tm, "LatestFrameReader", FakeLiveReader)
+    monkeypatch.setattr(tm, "MAX_FPS", 0)
+    monkeypatch.setattr(tm, "CROP_PASS", False)
+    shown = []
+
+    def on_frame(frame, visible, stats, motion):
+        shown.append((stats["mirage_frames"], [t.direction() for t in visible]))
+        return len(shown) >= 60
+
+    monitor = tm.Monitor(SlowMirage(), "rtsp://camera", str(tmp_path), on_frame=on_frame, log=lambda m: None)
+    monitor.run()
+    calls = len(SlowMirage.calls)
+    assert len(shown) == 60 and 3 <= calls <= 30, calls    # video did not wait for Mirage
+    assert any("coming" in dirs for _, dirs in shown)       # tracking still works from the frames Mirage saw
+    rows = list(csv.DictReader(open(tmp_path / "events.csv", encoding="utf-8")))
+    assert [r["direction"] for r in rows] == ["coming"]

@@ -31,12 +31,24 @@ from PIL import Image, ImageTk  # noqa: E402
 
 SETTINGS_FILE = HERE / "traffic_settings.json"
 
+# Country: (plate layouts, plate regex). Layouts win when set; the regex is
+# used when there are none.
 PLATE_PRESETS = {
-    "Any (use regex)": (),
-    "United Kingdom": ("AA99AAA",),
-    "Turkey": ("99A9999", "99A99999", "99AA999", "99AA9999", "99AAA99", "99AAA999"),
+    "Germany": ((), tm.GERMAN_PLATE_REGEX),
+    "United Kingdom": (("AA99AAA",), tm.ANY_PLATE_REGEX),
+    "Turkey": (("99A9999", "99A99999", "99AA999", "99AA9999", "99AAA99", "99AAA999"), tm.ANY_PLATE_REGEX),
+    "Any (letters and digits)": ((), tm.ANY_PLATE_REGEX),
 }
 CUSTOM = "Custom"
+
+# Saved values that were defaults in earlier versions; a saved file holding
+# one of these gets the current default instead, so new defaults reach
+# people who never changed the setting.
+OLD_DEFAULTS = {
+    "PLATE_REGEX": [r"^(?=.*[0-9])(?=.*[A-Z])[A-Z0-9]{4,9}$"],
+    "MAX_FPS": [10.0],
+    "CROP_EVERY": [2],
+}
 
 # (setting, kind, label, help, extra). Kinds: choice, int, float, optfloat
 # (blank = model default), bool, text, regex, list (comma separated), layouts.
@@ -56,7 +68,8 @@ SETTINGS = {
          "Mirage reads is logged and forgotten after this long.", (0.2, 600, 0.5)),
     ],
     "Plates": [
-        ("_PRESET", "preset", "Country", "Fills in the plate layouts for a country.", None),
+        ("_PRESET", "preset", "Country", "Sets the plate format for a country. Germany uses the regex "
+         "(district, letters, digits, E/H for electric or historic).", None),
         ("PLATE_FORMATS", "layouts", "Plate layouts", "A = letter, 9 = digit, comma separated, e.g. AA99AAA. Reads are "
          "corrected to fit (BSLIZ6B becomes BS11ZGB). Leave empty to use the regex below.", None),
         ("PLATE_MAX_FIXES", "int", "Max characters corrected", "How many characters a layout may correct in one read.",
@@ -73,8 +86,8 @@ SETTINGS = {
     "Reading": [
         ("CROP_PASS", "bool", "Second read at full resolution", "Read each unconfirmed plate again from a crop of the "
          "full-resolution frame. Much better for small plates, but slower.", None),
-        ("CROP_EVERY", "int", "Second read every N frames", "Do the second read only every Nth frame. Raise it if the "
-         "frame rate is too low.", (1, 100)),
+        ("CROP_EVERY", "int", "Second read every N passes", "Each Mirage pass gives at most one vehicle a second "
+         "read; this does it only every Nth pass. Raise it if Mirage is too slow.", (1, 100)),
         ("PLATE_CROP_PAD", "float", "Plate crop margin", "Extra margin around the plate box for the second read.",
          (0.0, 2.0, 0.05)),
         ("PLATE_CROP_MIN_WIDTH", "int", "Smallest plate to crop (px)", "Plate boxes narrower than this use the vehicle "
@@ -120,6 +133,8 @@ SETTINGS = {
         ("MOTION_LEARN_SECONDS", "float", "Background adapts in (s)", "How quickly lasting changes (daylight, a "
          "newly parked car) become part of the background. Vehicles being tracked are never absorbed while they "
          "are not parked.", (0.5, 3600, 1)),
+        ("MOTION_EXPOSURE", "bool", "Ignore brightness changes", "Cancels changes that brighten or darken the whole "
+         "picture (the camera's auto exposure, clouds), so they are not taken for motion.", None),
         ("MOTION_RESET_FRACTION", "float", "Reset when this much changes", "If this share of the frame changes at "
          "once (lights, day/night switch), the background starts again.", (0.05, 1.0, 0.05)),
         ("MOTION_FORGET_EMPTY", "float", "Fade motion with no vehicle", "When Mirage finds no vehicle where "
@@ -137,7 +152,8 @@ SETTINGS = {
          "folder"),
         ("SAVE_SNAPSHOTS", "bool", "Save a snapshot of each vehicle", "Saves one image per vehicle, taken when it was "
          "biggest.", None),
-        ("MAX_FPS", "float", "Max frames per second", "Cap on processed frames per second. 0 = no cap.", (0, 60, 1)),
+        ("MAX_FPS", "float", "Max video frames per second", "Cap on the video and motion check. Mirage runs on the "
+         "newest frame whenever it is free, as fast as the computer allows. 0 = no cap.", (0, 60, 1)),
         ("DUMP_JSON", "bool", "Show Mirage's raw output in the log", "Prints the JSON Mirage returns for the first "
          "frames after Start.", None),
         ("DUMP_JSON_FRAMES", "int", "Frames to show", "How many frames of raw output to print.", (1, 1000)),
@@ -211,7 +227,7 @@ def load_settings():
     kinds = {name: (kind, extra) for name, kind, _, _, extra in all_specs()}
     kinds["SOURCE"] = ("text", None)
     for name, value in saved.items():
-        if name not in kinds:
+        if name not in kinds or value in OLD_DEFAULTS.get(name, []):
             continue
         kind, extra = kinds[name]
         if kind == "bool":
@@ -310,22 +326,24 @@ class App:
 
         side = ttk.Frame(top, padding=(8, 0, 0, 0))
         top.add(side, weight=1)
+        # Bottom widgets first, so they stay visible and the tabs take the rest.
+        self.help_var = tk.StringVar(value="Point at a setting to see what it does. "
+                                           "Settings marked * apply at the next Start.")
+        ttk.Button(side, text="Reset all settings to defaults", command=self.reset).pack(side=tk.BOTTOM, anchor=tk.E)
+        ttk.Label(side, textvariable=self.help_var, style="Help.TLabel", wraplength=340,
+                  justify=tk.LEFT).pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 4))
         notebook = ttk.Notebook(side)
-        notebook.pack(fill=tk.BOTH, expand=True)
+        notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         for tab, specs in SETTINGS.items():
             page = ttk.Frame(notebook, padding=10)
             page.columnconfigure(1, weight=1)
             notebook.add(page, text=tab)
             for row, spec in enumerate(specs):
                 self._add_control(page, row, *spec)
-            if tab == "Motion":
-                ttk.Button(page, text="Reset background now", command=self.reset_background).grid(
-                    row=len(specs), column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
-        self.help_var = tk.StringVar(value="Point at a setting to see what it does. "
-                                           "Settings marked * apply at the next Start.")
-        ttk.Label(side, textvariable=self.help_var, style="Help.TLabel", wraplength=340,
-                  justify=tk.LEFT).pack(fill=tk.X, pady=(8, 4))
-        ttk.Button(side, text="Reset all settings to defaults", command=self.reset).pack(anchor=tk.E)
+            if tab == "Motion":   # beside "Show motion on the video", where the tab has room
+                row = [spec[0] for spec in specs].index("SHOW_MOTION")
+                ttk.Button(page, text="Reset background", command=self.reset_background).grid(
+                    row=row, column=1, sticky=tk.E)
 
         bottom = ttk.Notebook(vertical)
         vertical.add(bottom, weight=1)
@@ -366,7 +384,7 @@ class App:
             text_label.grid(row=row, column=0, sticky=tk.W, padx=(0, 8), pady=3)
             widgets.append(text_label)
             if kind == "preset":
-                var = tk.StringVar(value=self._preset_for(tm.PLATE_FORMATS))
+                var = tk.StringVar(value=self._preset_for(tm.PLATE_FORMATS, tm.PLATE_REGEX))
                 widget = ttk.Combobox(page, textvariable=var, state="readonly",
                                       values=list(PLATE_PRESETS) + [CUSTOM], width=18)
             else:
@@ -441,19 +459,26 @@ class App:
     # ----------------------------------------------------------- settings --
 
     @staticmethod
-    def _preset_for(layouts):
-        for preset, values in PLATE_PRESETS.items():
-            if tuple(values) == tuple(layouts):
+    def _preset_for(layouts, regex):
+        for preset, (values, pattern) in PLATE_PRESETS.items():
+            if tuple(values) == tuple(layouts) and (values or pattern == regex):
                 return preset
         return CUSTOM
+
+    def _sync_preset(self):
+        self._syncing = True
+        self.vars["_PRESET"][0].set(self._preset_for(tm.PLATE_FORMATS, tm.PLATE_REGEX))
+        self._syncing = False
 
     def apply(self, name):
         var, kind, extra = self.vars[name]
         if kind == "preset":
             if self._syncing or var.get() == CUSTOM:
                 return
+            layouts, pattern = PLATE_PRESETS[var.get()]
             self._syncing = True
-            self.vars["PLATE_FORMATS"][0].set(", ".join(PLATE_PRESETS[var.get()]))
+            self.vars["PLATE_FORMATS"][0].set(", ".join(layouts))
+            self.vars["PLATE_REGEX"][0].set(pattern)
             self._syncing = False
             return
         if kind == "bool":
@@ -471,10 +496,8 @@ class App:
             return
         self.errors[name].configure(text="")
         setattr(tm, name, value)
-        if name == "PLATE_FORMATS" and not self._syncing:
-            self._syncing = True
-            self.vars["_PRESET"][0].set(self._preset_for(value))
-            self._syncing = False
+        if name in ("PLATE_FORMATS", "PLATE_REGEX") and not self._syncing:
+            self._sync_preset()
 
     def reset(self):
         if not messagebox.askyesno("Reset settings", "Put every setting back to its default?"):
@@ -485,7 +508,7 @@ class App:
                 var, kind, _ = self.vars[name]
                 var.set(bool(value) if kind == "bool" else to_text(kind, value))
         self.source_var.set(DEFAULTS["SOURCE"])
-        self.vars["_PRESET"][0].set(self._preset_for(tm.PLATE_FORMATS))
+        self._sync_preset()
 
     def browse_setting(self, name, what):
         if what == "folder":
@@ -539,7 +562,7 @@ class App:
             post("status", "Connecting...")
 
             def on_frame(frame, visible, stats, motion):
-                annotated = tm.draw(frame.copy(), visible, stats["fps"], motion)
+                annotated = tm.draw(frame.copy(), visible, stats["fps"], motion, mirage_fps=stats["mirage_fps"])
                 with self.latest_lock:
                     self.latest = annotated
                 post("stats", stats)
@@ -571,10 +594,10 @@ class App:
                     self.log(payload)
                 elif kind == "stats":
                     share = payload["mirage_frames"] / max(1, payload["processed"])
-                    self.status_var.set(f"Running  \u2022  {payload['fps']:.1f} fps  \u2022  "
+                    self.status_var.set(f"Running  \u2022  video {payload['fps']:.1f} fps  \u2022  Mirage "
+                                        f"{payload['mirage_fps']:.1f}/s on {share:.0%} of frames  \u2022  "
                                         f"{payload['vehicles']} vehicles in view  \u2022  "
-                                        f"{payload['events']} logged  \u2022  Mirage ran on {share:.0%} "
-                                        f"of {payload['processed']} frames")
+                                        f"{payload['events']} logged")
                 elif kind == "event":
                     self.add_event(payload)
                 elif kind == "error":

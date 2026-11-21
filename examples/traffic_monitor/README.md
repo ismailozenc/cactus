@@ -48,8 +48,18 @@ is published) and the Mirage weights from Hugging Face, then caches them.
   does at the bottom of the panel. A value that is not allowed shows a red
   warning and the old value stays in use. Settings marked `*` (output folder,
   weights file) apply at the next Start.
-* **Plates > Country** fills in the plate layouts for the UK or Turkey. Other
-  layouts can be typed, with `A` for a letter and `9` for a digit.
+* **Plates > Country** sets the plate format: **Germany** (the default), the
+  UK or Turkey. German plates are matched with a pattern: district (1-3
+  letters, Ä Ö Ü allowed), 1-2 letters, 1-4 digits, then E or H optionally,
+  so "SB-FN 79E" is read as SBFN79E. Other layouts can be typed, with `A` for
+  a letter and `9` for a digit.
+* **Video speed:** for a camera, the video, the motion check and the overlay
+  run at the stream's rate (up to **Output > Max video frames per second**,
+  20 by default). Mirage runs alongside on the newest frame whenever it is
+  free. The status bar shows both rates, for example "video 20 fps, Mirage
+  1.5/s". Boxes follow the last frame Mirage finished, so they can trail a
+  fast car slightly. A video file is analysed frame by frame instead, so a
+  recording always gives the same result.
 * **Vehicles** at the bottom lists each vehicle when it leaves the picture:
   green for coming, orange for going. Double-click a row to open its
   snapshot. **Log** shows status messages and, if switched on under
@@ -86,6 +96,9 @@ The details that keep it reliable:
   the background within a few frames (**Fade motion with no vehicle**).
 * Half a parked car cut off at the edge of a crop is ignored, so it can't be
   mistaken for a moving vehicle.
+* Changes that brighten or darken the whole picture (the camera's auto
+  exposure, clouds) are cancelled out before comparing (**Ignore brightness
+  changes**), so they don't look like motion everywhere.
 * The camera's on-screen clock and name (Mirage calls them "watermark") never
   count as motion. If most of the frame changes at once (lights, the camera
   switching to night mode), the background starts again.
@@ -116,14 +129,14 @@ The window shows all of these. Their names in `traffic_monitor.py`:
 | `SOURCE` | RTSP URL, a video file, or a webcam number such as `"0"`. A recording is the easiest way to tune. |
 | `APPROACH` | Screen direction a vehicle moves in when it is coming towards you: `down`, `up`, `left`, `right`. |
 | `PLATE_FORMATS` | Plate layouts, `A` = letter and `9` = digit, e.g. `("AA99AAA",)` for the UK. Reads are corrected position by position (BSLIZ6B becomes BS11ZGB). The best accuracy setting. Also `--plate-format AA99AAA`. |
-| `PLATE_REGEX` | Used only when `PLATE_FORMATS` is empty: the plate after removing spaces and dashes. |
+| `PLATE_REGEX` | Used only when `PLATE_FORMATS` is empty: the plate after removing spaces and dashes. Default: `GERMAN_PLATE_REGEX`. `ANY_PLATE_REGEX` accepts any 4-9 letters and digits. |
 | `IGNORE_TEXT`, `IGNORE_TEXT_IN` | Text that is never a plate (the camera name `CAMERA01`), and object names whose text is skipped (`watermark`). |
 | `PLATE_WORDS`, `PLATE_BOX_VOTES` | Mirage detects "license plate" objects. Text inside one counts double, and the crop pass reads the plate box. |
 | `DUPLICATE_OVERLAP`, `DUPLICATE_SIZE_RATIO` | When two vehicle boxes cover the same vehicle, the smaller one is dropped. |
 | `PLATE_CONFIRM_VOTES` | Identical reads needed before a plate counts as confirmed. |
 | `DUMP_JSON` | Prints Mirage's raw JSON for the first frames. Use it on your first run. |
 | `BBOX_ORDER` | `xyxy` or `yxyx`. Switch it if boxes are drawn in the wrong place. |
-| `CROP_PASS`, `CROP_EVERY`, `CROP_MIN_WIDTH` | Second, full-resolution read of each unconfirmed vehicle. Costs speed. |
+| `CROP_PASS`, `CROP_EVERY`, `CROP_MIN_WIDTH` | Second, full-resolution read of an unconfirmed vehicle: at most one per Mirage pass, to the one that waited longest. Costs speed. |
 | `MOTION_GATE`, `MOTION_*` | The motion gate described above (Motion tab). |
 | `PARKED_SECONDS`, `PARKED_MOVE`, `LOG_PARKED` | When a vehicle counts as parked, and whether parked vehicles are logged. |
 | `MAX_UNSEEN_SECONDS` | A vehicle outside the area Mirage read is logged and forgotten after this long. |
