@@ -5,7 +5,13 @@ How it works
 ------------
 1. A background thread reads the RTSP stream and keeps only the newest frame,
    so a slow model never builds up a delay behind live video.
-2. Each processed frame goes through Mirage (``sections=["objects", "text"]``).
+2. A motion gate (``MotionGate``) compares a small grey copy of the frame
+   with a learnt background image. Nothing moving: Mirage is skipped. Motion:
+   only that part of the frame is sent, at full resolution, so parked cars
+   are never looked at and moving plates get more pixels. Areas where Mirage
+   then finds no vehicle fade into the background; vehicles being tracked
+   never do until they are parked.
+   Mirage reads the frame or crop (``sections=["objects", "text"]``).
    Objects whose label looks like a vehicle are kept, duplicate boxes of the
    same vehicle are dropped, and "license plate" objects are matched to the
    vehicle they sit on.
@@ -112,9 +118,35 @@ TEXT_CONF = None
 
 # Tracker.
 IOU_MATCH = 0.25               # minimum overlap to continue a track
-MAX_MISSED = 8                 # processed frames a track may go unseen
+MAX_MISSED = 8                 # analysed frames a track may go unseen
+MAX_UNSEEN_SECONDS = 2.0       # a track outside the analysed area ends after this
 MIN_TRACK_FRAMES = 3           # shorter tracks are dropped as noise
 DIRECTION_THRESHOLD = 0.08     # how much movement is needed to call a direction
+
+# Motion gate: a background image is learnt, and Mirage only looks where the
+# frame differs from it. With no motion Mirage is skipped entirely; with
+# motion only that part of the frame is sent, at full resolution.
+MOTION_GATE = True
+SHOW_MOTION = False            # tint moving pixels red and outline what Mirage reads
+MOTION_THRESHOLD = 25          # grey-level change (0-255) that counts as motion
+MOTION_MIN_AREA = 0.004        # smallest moving blob, as a share of the frame
+MOTION_PAD = 0.25              # margin added around the moving area
+MOTION_MIN_CROP = 0.3          # smallest crop sent to Mirage, as a share of the frame side
+MOTION_FULL_FRAME = 0.6        # send the whole frame when motion covers more than this
+MOTION_LEARN_SECONDS = 10.0    # how fast the background absorbs changes
+MOTION_RESET_FRACTION = 0.7    # this much of the frame changing at once resets the background
+# Moving areas where Mirage then finds no vehicle (a "ghost" left by a car that
+# was there when the background was learnt, a door, a shadow) fade into the
+# background this much per frame instead of slowly. Areas touching any vehicle
+# seen in the last MAX_UNSEEN_SECONDS are spared. 0 turns it off.
+MOTION_FORGET_EMPTY = 0.3
+
+# Parked vehicles: a vehicle that has not moved for PARKED_SECONDS is parked.
+# It gets no second plate read, is absorbed into the motion background, and
+# is not logged unless it moved at some point (or LOG_PARKED is on).
+PARKED_SECONDS = 20.0
+PARKED_MOVE = 0.03             # movement below this share of the frame does not count
+LOG_PARKED = False
 
 MAX_FPS = 10.0                 # cap on processed frames per second
 SHOW_WINDOW = True             # live preview window (press Q or Esc to stop)
@@ -447,6 +479,12 @@ class Track:
     best_snapshot: object = None
     best_area: float = 0.0
     plate_box: object = None   # plate Mirage found on this vehicle in the current frame
+    anchor: object = None      # where it was when it last moved (normalised centre)
+    last_moved: float = 0.0
+    ever_moved: bool = False
+
+    def is_parked(self, now: float) -> bool:
+        return now - self.last_moved >= PARKED_SECONDS
 
     @property
     def plate(self):
@@ -479,8 +517,14 @@ class Tracker:
         self.tracks: dict[int, Track] = {}
         self._next_id = 1
 
-    def update(self, detections, width: int, height: int, now: float):
-        """Match detections to tracks. Returns (matched_tracks, finished_tracks)."""
+    def update(self, detections, width: int, height: int, now: float, region=None):
+        """Match detections to tracks. Returns (matched_tracks, finished_tracks).
+
+        region is the part of the frame Mirage analysed: None for the whole
+        frame, a box for a crop, or False when Mirage was skipped. A track
+        outside it was not looked for, so instead of counting missed frames it
+        ends once unseen for MAX_UNSEEN_SECONDS.
+        """
         pairs = sorted(((iou(t.box, d[2]), tid, di)
                         for tid, t in self.tracks.items() for di, d in enumerate(detections)),
                        reverse=True)
@@ -505,13 +549,19 @@ class Tracker:
             cy = (box[1] + box[3]) / 2 / height
             area = (box[2] - box[0]) * (box[3] - box[1]) / (width * height)
             track.history.append((cx, cy, area))
+            if track.anchor is None:
+                track.anchor, track.last_moved = (cx, cy), now
+            elif math.dist((cx, cy), track.anchor) > PARKED_MOVE:
+                track.anchor, track.last_moved, track.ever_moved = (cx, cy), now, True
         finished = []
         live = {t.id for t, _ in matched}
         for tid in list(self.tracks):
             if tid not in live:
                 track = self.tracks[tid]
-                track.missed += 1
-                if track.missed > MAX_MISSED:
+                looked = region is None or (region is not False and contains_point(region, *centre(track.box)))
+                if looked:
+                    track.missed += 1
+                if track.missed > MAX_MISSED or (not looked and now - track.last_seen > MAX_UNSEEN_SECONDS):
                     finished.append(self.tracks.pop(tid))
         return [t for t, _ in matched], finished
 
@@ -519,6 +569,123 @@ class Tracker:
         finished = list(self.tracks.values())
         self.tracks.clear()
         return finished
+
+
+# ------------------------------------------------------------ motion gate --
+
+@dataclass
+class Motion:
+    """What the motion gate decided for one frame."""
+    action: str                # "full" (whole frame), "crop" (region only) or "skip"
+    reason: str
+    region: object = None      # (x0, y0, x1, y1) in frame pixels for "crop"
+    mask: object = None        # small uint8 mask of moving pixels, for display
+    boxes: list = field(default_factory=list)
+
+
+class MotionGate:
+    """Learns a background image and finds where the frame differs from it.
+
+    Works on a small blurred greyscale copy (WORK_WIDTH wide), so a frame costs
+    about a millisecond. The background follows slow changes (daylight,
+    parked cars) at a rate set by MOTION_LEARN_SECONDS, except inside boxes
+    passed as protect, so a vehicle waiting at a barrier is not absorbed.
+    """
+
+    WORK_WIDTH = 320
+
+    def __init__(self):
+        self.background = None
+        self.last_time = None
+        self.grey = None           # the last frame, small and grey
+        self.scale = 1.0
+        self.ignore = []           # frame boxes whose changes never count (camera clock)
+
+    def reset(self):
+        self.background = None
+
+    def absorb(self, boxes, rate: float):
+        """Blend the background towards the last frame inside boxes (frame pixels)."""
+        if self.background is None or self.grey is None or rate <= 0:
+            return
+        for box in boxes:
+            x0, y0, x1, y1 = (int(v * self.scale) for v in box)
+            x0, y0 = max(0, x0 - 2), max(0, y0 - 2)
+            bg, now = self.background[y0:y1 + 3, x0:x1 + 3], self.grey[y0:y1 + 3, x0:x1 + 3]
+            bg += min(1.0, rate) * (now - bg)
+
+    def update(self, frame, now: float, protect=()):
+        h, w = frame.shape[:2]
+        scale = min(1.0, self.WORK_WIDTH / w)
+        small = cv2.resize(frame, (max(1, round(w * scale)), max(1, round(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+        grey = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (5, 5), 0).astype(np.float32)
+        self.grey, self.scale = grey, scale
+        if self.background is None or self.background.shape != grey.shape:
+            self.background, self.last_time = grey, now
+            return Motion("full", "learning the background")
+
+        mask = (cv2.absdiff(grey, self.background) > MOTION_THRESHOLD).astype(np.uint8) * 255
+        if cv2.countNonZero(mask) > MOTION_RESET_FRACTION * mask.size:
+            self.background, self.last_time = grey, now   # lights, day/night switch, camera moved
+            return Motion("full", "scene changed, background reset", mask=mask)
+        for box in self.ignore:
+            x0, y0, x1, y1 = (int(v * scale) for v in box)
+            mask[max(0, y0 - 2):y1 + 3, max(0, x0 - 2):x1 + 3] = 0
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
+
+        # Learn: the background drifts towards the frame, except under protected boxes.
+        alpha = min(1.0, max(0.0, (now - self.last_time) / max(MOTION_LEARN_SECONDS, 1e-3)))
+        self.last_time = now
+        if alpha > 0:
+            learn = np.full(grey.shape, 255, np.uint8)
+            for box in protect:
+                x0, y0, x1, y1 = (int(v * scale) for v in box)
+                learn[max(0, y0):y1 + 1, max(0, x0):x1 + 1] = 0
+            cv2.accumulateWeighted(grey, self.background, alpha, mask=learn)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for contour in contours:
+            x, y, bw, bh = cv2.boundingRect(contour)
+            if bw * bh >= MOTION_MIN_AREA * mask.size:
+                boxes.append((int(x / scale), int(y / scale), int((x + bw) / scale), int((y + bh) / scale)))
+        if not boxes:
+            return Motion("skip", "no motion", mask=mask)
+
+        x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+        pad = MOTION_PAD * max(x1 - x0, y1 - y0)
+        x0, y0, x1, y1 = x0 - pad, y0 - pad, x1 + pad, y1 + pad
+        # Not too small, so Mirage still sees the whole vehicle around a moving part.
+        min_w, min_h = MOTION_MIN_CROP * w, MOTION_MIN_CROP * h
+        if x1 - x0 < min_w:
+            cx = (x0 + x1) / 2
+            x0, x1 = cx - min_w / 2, cx + min_w / 2
+        if y1 - y0 < min_h:
+            cy = (y0 + y1) / 2
+            y0, y1 = cy - min_h / 2, cy + min_h / 2
+        region = (int(max(0, x0)), int(max(0, y0)), int(min(w, x1)), int(min(h, y1)))
+        if area(region) >= MOTION_FULL_FRAME * w * h:
+            return Motion("full", "motion over most of the frame", mask=mask, boxes=boxes)
+        return Motion("crop", "motion", region=region, mask=mask, boxes=boxes)
+
+
+def cut_by_crop(box, region, width: int, height: int, margin: int = 3) -> bool:
+    """True if box touches an edge of region that is not also the frame edge,
+    i.e. Mirage saw only part of an object lying across the crop border."""
+    x0, y0, x1, y1 = region
+    return ((x0 > 0 and box[0] <= x0 + margin) or (y0 > 0 and box[1] <= y0 + margin)
+            or (x1 < width and box[2] >= x1 - margin) or (y1 < height and box[3] >= y1 - margin))
+
+
+def overlap(a, b):
+    return (max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3]))
+
+
+def shift(box, dx: int, dy: int):
+    return (box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy)
 
 
 # ----------------------------------------------------------------- outputs --
@@ -539,6 +706,8 @@ class EventLog:
 
     def write(self, track: Track):
         if len(track.history) < MIN_TRACK_FRAMES:
+            return None
+        if not LOG_PARKED and not track.ever_moved:
             return None
         stamp = datetime.fromtimestamp(track.first_seen)
         snapshot = ""
@@ -582,11 +751,21 @@ def crop(frame, box, pad: float):
     return crop_region(frame, box, pad)[0]
 
 
-def draw(frame, tracks, fps: float):
+def draw(frame, tracks, fps: float, motion: Motion = None, now: float = None):
     colours = {"coming": (0, 200, 0), "going": (0, 140, 255), "unknown": (200, 200, 200)}
+    now = time.time() if now is None else now
+    if SHOW_MOTION and motion is not None:
+        if motion.mask is not None:
+            big = cv2.resize(motion.mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+            frame[big] = (0.55 * frame[big] + 0.45 * np.array((0, 0, 255))).astype(np.uint8)
+        if motion.region is not None:
+            r = motion.region
+            cv2.rectangle(frame, (r[0], r[1]), (r[2], r[3]), (0, 255, 255), 2)
+        cv2.putText(frame, f"Mirage: {motion.action} ({motion.reason})", (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     for t in tracks:
-        direction = t.direction()
-        colour = colours[direction]
+        direction = "parked" if t.is_parked(now) else t.direction()
+        colour = colours.get(direction, (130, 130, 130))
         x0, y0, x1, y1 = t.box
         cv2.rectangle(frame, (x0, y0), (x1, y1), colour, 2)
         if t.plate_box is not None:
@@ -723,7 +902,7 @@ class Monitor:
     Settings are read from this module's globals on every frame, so changing
     one (for example ``traffic_monitor.APPROACH = "up"``) applies while it runs.
 
-    on_frame(frame_bgr, active_tracks, stats) is called after every processed
+    on_frame(frame_bgr, visible_tracks, stats, motion) is called after every
     frame; return True from it to stop. on_event(row) is called for every row
     written to events.csv, and log(message) for status messages.
     """
@@ -731,7 +910,8 @@ class Monitor:
     def __init__(self, vision, source, output_dir, on_frame=None, on_event=None, log=print):
         self.vision, self.source, self.output_dir = vision, source, output_dir
         self.on_frame, self.on_event, self.log = on_frame, on_event, log
-        self.stats = {"processed": 0, "fps": 0.0, "vehicles": 0, "events": 0}
+        self.stats = {"processed": 0, "fps": 0.0, "vehicles": 0, "events": 0, "mirage_frames": 0}
+        self.gate = MotionGate()
 
     def run(self, stop: threading.Event = None):
         stop = stop or threading.Event()
@@ -761,22 +941,51 @@ class Monitor:
                     self.log("end of video")
                     break
                 height, width = frame.shape[:2]
-                rgb = np.ascontiguousarray(frame[:, :, ::-1])  # OpenCV gives BGR
-                result = self.vision.describe(rgb, **mirage_options(["objects", "text"]))
-                if DUMP_JSON and stats["processed"] < DUMP_JSON_FRAMES:
-                    self.log(json.dumps(result, ensure_ascii=False, indent=2)[:6000])
+                now = time.time()
+                if MOTION_GATE:
+                    protect = [t.box for t in tracker.tracks.values()
+                               if now - t.last_seen < MAX_UNSEEN_SECONDS and not t.is_parked(now)]
+                    motion = self.gate.update(frame, now, protect)
+                else:
+                    self.gate.reset()   # start afresh if the gate is switched back on
+                    motion = Motion("full", "motion gate off")
 
-                vehicles, plate_boxes, ignored = split_objects(parse_objects(result, width, height))
-                active, finished = tracker.update(vehicles, width, height, time.time())
-                assign_plates(active, plate_boxes)
-                assign_text(active, parse_text(result, width, height), ignored)
-
-                for track in active:
-                    size = area(track.box)
-                    if SAVE_SNAPSHOTS and size > track.best_area:
-                        track.best_area, track.best_snapshot = size, crop(frame, track.box, CROP_PAD).copy()
-                    if CROP_PASS and not track.plate_confirmed and stats["processed"] % max(1, CROP_EVERY) == 0:
-                        crop_pass(self.vision, frame, track, ignored)
+                if motion.action == "skip":
+                    active, finished = tracker.update([], width, height, now, region=False)
+                else:
+                    region = motion.region if motion.action == "crop" else None
+                    x0, y0 = (region[0], region[1]) if region else (0, 0)
+                    image = frame[region[1]:region[3], region[0]:region[2]] if region else frame
+                    rgb = np.ascontiguousarray(image[:, :, ::-1])  # OpenCV gives BGR
+                    result = self.vision.describe(rgb, **mirage_options(["objects", "text"]))
+                    stats["mirage_frames"] += 1
+                    if DUMP_JSON and stats["mirage_frames"] <= DUMP_JSON_FRAMES:
+                        self.log(json.dumps(result, ensure_ascii=False, indent=2)[:6000])
+                    ih, iw = image.shape[:2]
+                    objects = [(label, score, shift(box, x0, y0))
+                               for label, score, box in parse_objects(result, iw, ih)]
+                    lines = [(text, shift(box, x0, y0) if box else None) for text, box in parse_text(result, iw, ih)]
+                    vehicles, plate_boxes, ignored = split_objects(objects)
+                    if region:   # half a parked car at the crop border is not a moving vehicle
+                        vehicles = [v for v in vehicles if not cut_by_crop(v[2], region, width, height)]
+                    if ignored:
+                        self.gate.ignore = ignored   # the camera's clock is not motion
+                    active, finished = tracker.update(vehicles, width, height, now, region=region)
+                    if motion.boxes:
+                        # Spare any vehicle seen recently, even if Mirage missed it this frame.
+                        recent = [t.box for t in tracker.tracks.values()
+                                  if now - t.last_seen <= MAX_UNSEEN_SECONDS]
+                        empty = [b for b in motion.boxes if not any(area(overlap(b, r)) > 0 for r in recent)]
+                        self.gate.absorb(empty, MOTION_FORGET_EMPTY)
+                    assign_plates(active, plate_boxes)
+                    assign_text(active, lines, ignored)
+                    for track in active:
+                        size = area(track.box)
+                        if SAVE_SNAPSHOTS and size > track.best_area:
+                            track.best_area, track.best_snapshot = size, crop(frame, track.box, CROP_PAD).copy()
+                        if (CROP_PASS and not track.plate_confirmed and not track.is_parked(now)
+                                and stats["processed"] % max(1, CROP_EVERY) == 0):
+                            crop_pass(self.vision, frame, track, ignored)
                 emit(finished)
 
                 stats["processed"] += 1
@@ -788,7 +997,8 @@ class Monitor:
                 fps = rate if stats["processed"] == 1 else 0.9 * fps + 0.1 * rate
                 stats["fps"], stats["vehicles"] = fps, len(tracker.tracks)
 
-                if self.on_frame and self.on_frame(frame, active, dict(stats)):
+                visible = [t for t in tracker.tracks.values() if now - t.last_seen <= 1.0]
+                if self.on_frame and self.on_frame(frame, visible, dict(stats), motion):
                     break
                 min_interval = 1.0 / MAX_FPS if MAX_FPS > 0 else 0.0
                 if min_interval > elapsed:
@@ -874,16 +1084,18 @@ def main(argv=None):
         raise SystemExit(str(exc))
     window = {"ok": SHOW_WINDOW}
 
-    def show(frame, active, stats):
+    def show(frame, active, stats, motion):
         if window["ok"]:
             try:
-                cv2.imshow("Traffic monitor (Q to quit)", draw(frame.copy(), active, stats["fps"]))
+                cv2.imshow("Traffic monitor (Q to quit)", draw(frame.copy(), active, stats["fps"], motion))
                 return cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27)
             except cv2.error:
                 print("no display available; continuing without the preview window")
                 window["ok"] = False
         elif stats["processed"] % 50 == 0:
-            print(f"{stats['processed']} frames, {stats['fps']:.1f} fps, {stats['vehicles']} vehicles in view")
+            share = stats["mirage_frames"] / max(1, stats["processed"])
+            print(f"{stats['processed']} frames, {stats['fps']:.1f} fps, {stats['vehicles']} vehicles in view, "
+                  f"Mirage ran on {share:.0%} of frames")
         return False
 
     try:

@@ -250,3 +250,144 @@ def test_missing_package_message_names_pip_package_and_python():
 
 def test_mirage_loads_from_package_or_this_clone():
     assert tm.load_mirage().__name__ == "Mirage"
+
+
+# ------------------------------------------------------------ motion gate --
+
+def street(cars=(), brightness=80, size=(360, 640)):
+    frame = np.full((*size, 3), brightness, np.uint8)
+    for x0, y0, x1, y1 in cars:
+        cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 255, 255), -1)
+    return frame
+
+
+def test_motion_gate_skips_still_frames_and_crops_motion(monkeypatch):
+    monkeypatch.setattr(tm, "MOTION_LEARN_SECONDS", 10.0)
+    gate = tm.MotionGate()
+    parked = (500, 250, 600, 320)
+    assert gate.update(street([parked]), 0.0).action == "full"      # first frame: learn it
+    assert gate.update(street([parked]), 0.1).action == "skip"      # parked car is background
+    moving = (100, 100, 180, 160)
+    motion = gate.update(street([parked, moving]), 0.2)
+    assert motion.action == "crop"
+    r = motion.region
+    assert r[0] <= 100 and r[1] <= 100 and r[2] >= 180 and r[3] >= 160
+    assert tm.area(r) < 0.6 * 640 * 360 and not tm.contains_point(r, 550, 285)
+
+
+def test_motion_gate_absorbs_parked_cars_but_not_protected_ones(monkeypatch):
+    monkeypatch.setattr(tm, "MOTION_LEARN_SECONDS", 1.0)
+    car = (100, 100, 180, 160)
+
+    def actions(protect):
+        gate = tm.MotionGate()
+        gate.update(street(), 0.0)
+        return [gate.update(street([car]), t / 2, protect).action for t in range(1, 13)]
+
+    parked = actions(())
+    assert parked[0] == "crop" and parked[-1] == "skip"         # a car that stays fades into the background
+    assert set(actions((car,))) == {"crop"}                      # a tracked, not-parked car never does
+
+
+def test_motion_gate_resets_on_whole_scene_change_and_ignores_clock(monkeypatch):
+    gate = tm.MotionGate()
+    gate.update(street(), 0.0)
+    changed = gate.update(street(brightness=200), 0.1)
+    assert changed.action == "full" and "reset" in changed.reason
+    assert gate.update(street(brightness=200), 0.2).action == "skip"
+    gate.ignore = [(520, 320, 640, 360)]                       # e.g. a "watermark" clock
+    clock = street(brightness=200)
+    clock[330:350, 540:620] = 0
+    assert gate.update(clock, 0.3).action == "skip"
+
+
+def test_tracks_outside_the_analysed_area_end_by_time(monkeypatch):
+    monkeypatch.setattr(tm, "MAX_MISSED", 2)
+    monkeypatch.setattr(tm, "MAX_UNSEEN_SECONDS", 2.0)
+    tracker = tm.Tracker()
+    tracker.update([("car", None, (10, 10, 50, 50))], 100, 100, 0.0)
+    for t in (0.5, 1.0, 1.5):    # Mirage looked elsewhere: no missed frames counted
+        assert tracker.update([], 100, 100, t, region=(60, 60, 100, 100)) == ([], [])
+    assert tracker.update([], 100, 100, 1.9, region=False) == ([], [])
+    _, finished = tracker.update([], 100, 100, 2.5, region=False)
+    assert len(finished) == 1
+
+
+def test_parked_vehicles_are_flagged_and_not_logged(tmp_path, monkeypatch):
+    monkeypatch.setattr(tm, "PARKED_SECONDS", 5.0)
+    tracker = tm.Tracker()
+    for t in range(8):
+        active, _ = tracker.update([("car", None, (10 + t % 2, 10, 50, 50))], 100, 100, float(t))
+    parked = active[0]
+    assert parked.is_parked(7.0) and not parked.ever_moved
+    log = tm.EventLog(str(tmp_path))
+    assert log.write(parked) is None
+    monkeypatch.setattr(tm, "LOG_PARKED", True)
+    assert log.write(parked) is not None
+    log.close()
+
+
+class CountingMirage:
+    """Finds every white rectangle; counts calls and records image sizes."""
+    calls = []
+
+    def __init__(self, weights=None):
+        CountingMirage.calls = []
+
+    def describe(self, image, *, sections, **_):
+        CountingMirage.calls.append((image.shape[1], image.shape[0], tuple(sections)))
+        h, w = image.shape[:2]
+        n, _, stats, _ = cv2.connectedComponentsWithStats((image[:, :, 0] > 200).astype(np.uint8))
+        out = {"objects": [], "text": []}
+        for k in range(1, n):
+            x, y, bw, bh, a = stats[k]
+            if a < 300:
+                continue
+            box = [x / w * 1000, y / h * 1000, (x + bw) / w * 1000, (y + bh) / h * 1000]
+            if "objects" in sections:
+                out["objects"].append({"id": k, "name": "car", "bbox": [round(v) for v in box]})
+            out["text"].append({"string": "34 ABC 123", "bbox": [round(v) for v in box]})
+        return out
+
+
+def test_detections_cut_by_the_crop_border_are_dropped():
+    region = (100, 50, 300, 250)
+    assert tm.cut_by_crop((280, 100, 299, 150), region, 640, 360)       # sliced at the right edge
+    assert not tm.cut_by_crop((150, 100, 250, 200), region, 640, 360)   # wholly inside
+    assert not tm.cut_by_crop((0, 100, 50, 150), (0, 50, 300, 250), 640, 360)  # frame edge is real
+
+
+@pytest.mark.parametrize("parked", [(480, 240, 600, 320), (200, 150, 300, 210)],
+                         ids=["parked-far", "parked-next-to-the-road"])
+def test_end_to_end_motion_gate_saves_calls_and_hides_parked_car(tmp_path, monkeypatch, parked):
+    video = tmp_path / "street.avi"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (640, 360))
+    for i in range(60):
+        cars = [parked]
+        if 15 <= i < 40:                      # one car drives down the left side
+            y = 20 + 9 * (i - 15)
+            cars.append((80, y, 160 + (i - 15), y + 60))
+        writer.write(street(cars))
+    writer.release()
+    monkeypatch.setitem(sys.modules, "cactus", types.SimpleNamespace(Mirage=CountingMirage))
+    monkeypatch.setattr(tm, "CROP_PASS", False)
+    out = tmp_path / "out"
+    tm.main(["--source", str(video), "--no-window", "--output", str(out), "--max-fps", "0"])
+    rows = list(csv.DictReader(open(out / "events.csv", encoding="utf-8")))
+    assert [r["direction"] for r in rows] == ["coming"], rows     # parked car is not logged
+    assert rows[0]["plate"] == "34ABC123"
+    calls = CountingMirage.calls
+    assert len(calls) <= 30, len(calls)               # 60 frames, Mirage only while the car moves
+    assert any(w < 640 for w, _, _ in calls)          # and mostly on a crop, not the whole frame
+
+
+def test_ghost_of_a_departed_car_fades_once_mirage_finds_nothing(monkeypatch):
+    monkeypatch.setattr(tm, "MOTION_LEARN_SECONDS", 1000.0)   # slow learning: only absorb() helps
+    gate = tm.MotionGate()
+    gate.update(street([(100, 100, 180, 160)]), 0.0)            # learnt with a car that then leaves
+    motion = gate.update(street(), 0.1)
+    assert motion.action == "crop"                              # the ghost looks like motion
+    for t in range(2, 6):
+        gate.absorb(motion.boxes, 0.5)                          # Mirage found no vehicle there
+        motion = gate.update(street(), t / 10)
+    assert motion.action == "skip"

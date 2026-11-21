@@ -58,6 +58,41 @@ is published) and the Mirage weights from Hugging Face, then caches them.
   you close the window. **Reset all settings to defaults** undoes everything.
   That file can contain your camera password, so it is kept out of git.
 
+## Saving CPU: the motion gate
+
+Mirage costs the same for every image it reads, whatever is in it, so the
+saving comes from not calling it. With **Motion > Only run Mirage where things
+move** on (the default):
+
+1. The program keeps a **background image**: a small, blurred, greyscale
+   picture of the empty scene that slowly follows daylight changes.
+2. Every frame is compared with it, which takes about a millisecond. Pixels
+   that differ by more than **Change that counts** are motion.
+3. **No motion:** Mirage is skipped. Parked cars are part of the background,
+   so they never trigger it.
+4. **Motion:** only the moving area, plus a margin, is cut from the
+   full-resolution frame and sent to Mirage. The car fills more of Mirage's
+   input, so its plate reads better too. If motion covers most of the frame,
+   the whole frame is sent.
+
+The details that keep it reliable:
+
+* A vehicle being followed is never learnt into the background, so a car
+  waiting at a barrier keeps being read. Once it has not moved for **Parked
+  after (s)** it counts as parked. It then gets no more plate reads, fades
+  into the background, and is not logged unless it moved at some point.
+* When a car that was in the first frame drives off, its old spot looks like
+  motion (a "ghost"). Mirage finds no vehicle there, so that area fades into
+  the background within a few frames (**Fade motion with no vehicle**).
+* Half a parked car cut off at the edge of a crop is ignored, so it can't be
+  mistaken for a moving vehicle.
+* The camera's on-screen clock and name (Mirage calls them "watermark") never
+  count as motion. If most of the frame changes at once (lights, the camera
+  switching to night mode), the background starts again.
+* **Show motion on the video** tints moving pixels red and outlines in yellow
+  what Mirage reads. The status bar shows how often Mirage actually ran.
+  **Reset background now** relearns the empty scene.
+
 **Running the tests from menus:** **Test > Test Explorer**. If Visual
 Studio asks, pick **pytest** as the framework and the project folder as the
 root, then click **Run All**.
@@ -89,6 +124,9 @@ The window shows all of these. Their names in `traffic_monitor.py`:
 | `DUMP_JSON` | Prints Mirage's raw JSON for the first frames. Use it on your first run. |
 | `BBOX_ORDER` | `xyxy` or `yxyx`. Switch it if boxes are drawn in the wrong place. |
 | `CROP_PASS`, `CROP_EVERY`, `CROP_MIN_WIDTH` | Second, full-resolution read of each unconfirmed vehicle. Costs speed. |
+| `MOTION_GATE`, `MOTION_*` | The motion gate described above (Motion tab). |
+| `PARKED_SECONDS`, `PARKED_MOVE`, `LOG_PARKED` | When a vehicle counts as parked, and whether parked vehicles are logged. |
+| `MAX_UNSEEN_SECONDS` | A vehicle outside the area Mirage read is logged and forgotten after this long. |
 | `MAX_FPS`, `SHOW_WINDOW`, `OUTPUT_DIR` | Frame cap, preview window, and output folder. |
 
 ## First run checklist

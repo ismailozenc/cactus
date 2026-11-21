@@ -52,6 +52,8 @@ SETTINGS = {
          "forgotten.", (1, 500)),
         ("MIN_TRACK_FRAMES", "int", "Shortest track to log", "Vehicles seen in fewer frames than this are treated as noise.",
          (1, 500)),
+        ("MAX_UNSEEN_SECONDS", "float", "Forget after (s) unseen", "With the motion gate, a vehicle outside the area "
+         "Mirage reads is logged and forgotten after this long.", (0.2, 600, 0.5)),
     ],
     "Plates": [
         ("_PRESET", "preset", "Country", "Fills in the plate layouts for a country.", None),
@@ -98,6 +100,37 @@ SETTINGS = {
          "box, which means a car further away.", (0.0, 1.0, 0.05)),
         ("BBOX_ORDER", "choice", "Box order", "Switch to yxyx only if boxes are drawn in the wrong place.",
          ("xyxy", "yxyx")),
+    ],
+    "Motion": [
+        ("MOTION_GATE", "bool", "Only run Mirage where things move", "Learns what the empty scene looks like and "
+         "runs Mirage only on the part of the frame that changed, or not at all when nothing moves. Saves most "
+         "of the CPU and reads moving plates at higher resolution.", None),
+        ("SHOW_MOTION", "bool", "Show motion on the video", "Tints moving pixels red and outlines in yellow the part "
+         "Mirage reads. Use it while tuning the settings below.", None),
+        ("MOTION_THRESHOLD", "int", "Change that counts (0-255)", "How much a pixel's brightness must differ from the "
+         "background to count as motion. Raise it if rain, noise or swaying trees trigger Mirage.", (1, 255)),
+        ("MOTION_MIN_AREA", "float", "Smallest moving blob", "Moving areas smaller than this share of the frame are "
+         "ignored (insects, leaves, the camera clock).", (0.0, 0.5, 0.001)),
+        ("MOTION_PAD", "float", "Margin around motion", "Extra margin around the moving area, so Mirage sees the "
+         "whole vehicle.", (0.0, 2.0, 0.05)),
+        ("MOTION_MIN_CROP", "float", "Smallest crop", "The crop sent to Mirage is at least this share of the frame's "
+         "width and height.", (0.05, 1.0, 0.05)),
+        ("MOTION_FULL_FRAME", "float", "Whole frame above", "When motion covers more than this share of the frame, "
+         "the whole frame is sent.", (0.05, 1.0, 0.05)),
+        ("MOTION_LEARN_SECONDS", "float", "Background adapts in (s)", "How quickly lasting changes (daylight, a "
+         "newly parked car) become part of the background. Vehicles being tracked are never absorbed while they "
+         "are not parked.", (0.5, 3600, 1)),
+        ("MOTION_RESET_FRACTION", "float", "Reset when this much changes", "If this share of the frame changes at "
+         "once (lights, day/night switch), the background starts again.", (0.05, 1.0, 0.05)),
+        ("MOTION_FORGET_EMPTY", "float", "Fade motion with no vehicle", "When Mirage finds no vehicle where "
+         "something changed (a ghost of a car that has left, a shadow, a door), that area fades into the "
+         "background this much per frame. 0 = off.", (0.0, 1.0, 0.1)),
+        ("PARKED_SECONDS", "float", "Parked after (s)", "A vehicle that has not moved for this long is parked: no "
+         "second plate read, and it fades into the background.", (1, 86400, 1)),
+        ("PARKED_MOVE", "float", "Movement that counts", "Moves smaller than this share of the frame do not count "
+         "(box jitter).", (0.0, 0.5, 0.005)),
+        ("LOG_PARKED", "bool", "Log vehicles that never moved", "Off: parked cars are not written to events.csv.",
+         None),
     ],
     "Output": [
         ("OUTPUT_DIR", "text", "Output folder *", "Folder for events.csv and snapshots. Applies at the next Start.",
@@ -213,6 +246,7 @@ class App:
         self.queue = queue.Queue()
         self.vision, self.vision_weights = None, None
         self.worker, self.stop_event = None, threading.Event()
+        self.monitor = None
         self.latest = None            # newest annotated frame from the worker
         self.latest_lock = threading.Lock()
         self.photo = None
@@ -284,6 +318,9 @@ class App:
             notebook.add(page, text=tab)
             for row, spec in enumerate(specs):
                 self._add_control(page, row, *spec)
+            if tab == "Motion":
+                ttk.Button(page, text="Reset background now", command=self.reset_background).grid(
+                    row=len(specs), column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
         self.help_var = tk.StringVar(value="Point at a setting to see what it does. "
                                            "Settings marked * apply at the next Start.")
         ttk.Label(side, textvariable=self.help_var, style="Help.TLabel", wraplength=340,
@@ -354,6 +391,11 @@ class App:
         var.trace_add("write", lambda *_a, n=name: self.apply(n))
         for w in widgets:
             w.bind("<Enter>", lambda _e, t=help_text: self.help_var.set(t))
+
+    def reset_background(self):
+        if self.monitor is not None:
+            self.monitor.gate.reset()
+            self.log("Motion background reset; the next frame is learnt as the empty scene.")
 
     def _check_packages(self):
         self.log(f"Python: {sys.executable}")
@@ -496,16 +538,17 @@ class App:
                 self.vision, self.vision_weights = tm.create_mirage(weights), weights
             post("status", "Connecting...")
 
-            def on_frame(frame, active, stats):
-                annotated = tm.draw(frame.copy(), active, stats["fps"])
+            def on_frame(frame, visible, stats, motion):
+                annotated = tm.draw(frame.copy(), visible, stats["fps"], motion)
                 with self.latest_lock:
                     self.latest = annotated
                 post("stats", stats)
                 return False
 
-            tm.Monitor(self.vision, source, output, on_frame=on_frame,
-                       on_event=lambda row: post("event", row),
-                       log=lambda message: post("log", message)).run(self.stop_event)
+            self.monitor = tm.Monitor(self.vision, source, output, on_frame=on_frame,
+                                      on_event=lambda row: post("event", row),
+                                      log=lambda message: post("log", message))
+            self.monitor.run(self.stop_event)
         except tm.MissingPackage as exc:
             post("error", str(exc))
         except tm.SourceError as exc:
@@ -527,9 +570,11 @@ class App:
                     self.status_var.set(payload)
                     self.log(payload)
                 elif kind == "stats":
-                    self.status_var.set(f"Running  •  {payload['fps']:.1f} fps  •  "
-                                        f"{payload['vehicles']} vehicles in view  •  "
-                                        f"{payload['events']} logged  •  {payload['processed']} frames")
+                    share = payload["mirage_frames"] / max(1, payload["processed"])
+                    self.status_var.set(f"Running  \u2022  {payload['fps']:.1f} fps  \u2022  "
+                                        f"{payload['vehicles']} vehicles in view  \u2022  "
+                                        f"{payload['events']} logged  \u2022  Mirage ran on {share:.0%} "
+                                        f"of {payload['processed']} frames")
                 elif kind == "event":
                     self.add_event(payload)
                 elif kind == "error":
