@@ -132,10 +132,15 @@ import numpy as np  # noqa: E402
 
 # ------------------------------------------------------------ video input --
 
+class SourceError(RuntimeError):
+    """The camera or file could not be opened."""
+
+
 class LatestFrameReader:
     """Reads a stream on a thread and always hands out the newest frame."""
 
-    def __init__(self, source: str):
+    def __init__(self, source: str, log=None):
+        self.log = log or (lambda msg: print(msg, file=sys.stderr))
         self.source = int(source) if source.isdigit() else source
         self.is_live = isinstance(self.source, int) or "://" in str(self.source)
         self._frame = None
@@ -151,7 +156,7 @@ class LatestFrameReader:
         cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG) if isinstance(self.source, str) \
             else cv2.VideoCapture(self.source)
         if not cap.isOpened():
-            raise SystemExit(f"could not open video source: {redact(str(self.source))}")
+            raise SourceError(f"could not open video source: {redact(str(self.source))}")
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
@@ -162,13 +167,14 @@ class LatestFrameReader:
                 if not self.is_live:
                     self._ended.set()
                     return
-                print("stream dropped, reconnecting in 2 s ...", file=sys.stderr)
+                self.log("stream dropped, reconnecting in 2 s ...")
                 self._cap.release()
-                time.sleep(2)
+                if self._stop.wait(2):
+                    return
                 try:
                     self._cap = self._open()
-                except SystemExit as exc:
-                    print(exc, file=sys.stderr)
+                except SourceError as exc:
+                    self.log(str(exc))
                 continue
             with self._lock:
                 self._frame, self._seq = frame, self._seq + 1
@@ -340,7 +346,6 @@ def drop_duplicates(detections):
 
 # ------------------------------------------------------------------ plates --
 
-_plate_re = re.compile(PLATE_REGEX)
 # Characters OCR commonly swaps; tried when a read does not fit the format.
 _AMBIGUOUS = {"O": "0", "0": "O", "I": "1", "1": "I", "S": "5", "5": "S",
               "B": "8", "8": "B", "Z": "2", "2": "Z", "G": "6", "6": "G"}
@@ -406,7 +411,7 @@ def plate_candidates(text: str):
         return []
     if PLATE_FORMATS:
         return _fit_formats(cleaned)
-    if _plate_re.match(cleaned):
+    if re.match(PLATE_REGEX, cleaned):
         return [cleaned]
     # Try fixing one ambiguous character at a time, but only for text that
     # already mixes letters and digits, so signs such as "STOP" stay out.
@@ -415,7 +420,7 @@ def plate_candidates(text: str):
     for i, ch in enumerate(cleaned):
         if ch in _AMBIGUOUS:
             fixed = cleaned[:i] + _AMBIGUOUS[ch] + cleaned[i + 1:]
-            if _plate_re.match(fixed):
+            if re.match(PLATE_REGEX, fixed):
                 return [fixed]
     return []
 
@@ -534,7 +539,7 @@ class EventLog:
 
     def write(self, track: Track):
         if len(track.history) < MIN_TRACK_FRAMES:
-            return
+            return None
         stamp = datetime.fromtimestamp(track.first_seen)
         snapshot = ""
         if SAVE_SNAPSHOTS and track.best_snapshot is not None:
@@ -556,8 +561,7 @@ class EventLog:
         }
         self._csv.writerow(row)
         self._file.flush()
-        print(f"[event] #{row['track_id']} {row['vehicle']:<10} {row['direction']:<8} "
-              f"plate={row['plate'] or '-'} ({row['plate_votes']} votes)")
+        return row
 
     def close(self):
         self._file.close()
@@ -675,7 +679,7 @@ def crop_pass(vision, frame, track, ignored):
 
 
 def parse_args(argv=None):
-    global SOURCE, APPROACH, DUMP_JSON, BBOX_ORDER, SHOW_WINDOW, MAX_FPS, OUTPUT_DIR, PLATE_REGEX, _plate_re
+    global SOURCE, APPROACH, DUMP_JSON, BBOX_ORDER, SHOW_WINDOW, MAX_FPS, OUTPUT_DIR, PLATE_REGEX
     global PLATE_FORMATS
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--source", default=SOURCE, help="RTSP URL, video file or webcam number")
@@ -695,7 +699,11 @@ def parse_args(argv=None):
     SOURCE, APPROACH, DUMP_JSON = args.source, args.approach, args.dump_json
     BBOX_ORDER, MAX_FPS, OUTPUT_DIR = args.bbox_order, args.max_fps, args.output
     SHOW_WINDOW = SHOW_WINDOW and not args.no_window
-    PLATE_REGEX, _plate_re = args.plate_regex, re.compile(args.plate_regex)
+    try:
+        re.compile(args.plate_regex)
+    except re.error as exc:
+        p.error(f"--plate-regex is not a valid regular expression: {exc}")
+    PLATE_REGEX = args.plate_regex
     if args.plate_format:
         bad = [f for f in args.plate_format if not re.fullmatch(r"[A9]+", f.upper())]
         if bad:
@@ -704,75 +712,121 @@ def parse_args(argv=None):
     return args
 
 
+def format_event(row) -> str:
+    return (f"[event] #{row['track_id']} {row['vehicle']:<10} {row['direction']:<8} "
+            f"plate={row['plate'] or '-'} ({row['plate_votes']} votes)")
+
+
+class Monitor:
+    """The detect, track and read loop, shared by the command line and the GUI.
+
+    Settings are read from this module's globals on every frame, so changing
+    one (for example ``traffic_monitor.APPROACH = "up"``) applies while it runs.
+
+    on_frame(frame_bgr, active_tracks, stats) is called after every processed
+    frame; return True from it to stop. on_event(row) is called for every row
+    written to events.csv, and log(message) for status messages.
+    """
+
+    def __init__(self, vision, source, output_dir, on_frame=None, on_event=None, log=print):
+        self.vision, self.source, self.output_dir = vision, source, output_dir
+        self.on_frame, self.on_event, self.log = on_frame, on_event, log
+        self.stats = {"processed": 0, "fps": 0.0, "vehicles": 0, "events": 0}
+
+    def run(self, stop: threading.Event = None):
+        stop = stop or threading.Event()
+        self.log(f"opening {redact(str(self.source))}")
+        reader = LatestFrameReader(str(self.source), log=self.log)
+        tracker, events = Tracker(), EventLog(self.output_dir)
+        self.log(f"logging to {events.path.resolve()}")
+        seq, fps, last_done = 0, 0.0, None
+        stats = self.stats
+
+        def emit(finished):
+            for track in finished:
+                row = events.write(track)
+                if row is not None:
+                    stats["events"] += 1
+                    self.log(format_event(row))
+                    if self.on_event:
+                        self.on_event(row)
+
+        try:
+            while not stop.is_set():
+                started = time.monotonic()
+                seq, frame = reader.read(seq, timeout=0.5)
+                if frame is None:
+                    if reader.is_live:
+                        continue  # waiting or reconnecting
+                    self.log("end of video")
+                    break
+                height, width = frame.shape[:2]
+                rgb = np.ascontiguousarray(frame[:, :, ::-1])  # OpenCV gives BGR
+                result = self.vision.describe(rgb, **mirage_options(["objects", "text"]))
+                if DUMP_JSON and stats["processed"] < DUMP_JSON_FRAMES:
+                    self.log(json.dumps(result, ensure_ascii=False, indent=2)[:6000])
+
+                vehicles, plate_boxes, ignored = split_objects(parse_objects(result, width, height))
+                active, finished = tracker.update(vehicles, width, height, time.time())
+                assign_plates(active, plate_boxes)
+                assign_text(active, parse_text(result, width, height), ignored)
+
+                for track in active:
+                    size = area(track.box)
+                    if SAVE_SNAPSHOTS and size > track.best_area:
+                        track.best_area, track.best_snapshot = size, crop(frame, track.box, CROP_PAD).copy()
+                    if CROP_PASS and not track.plate_confirmed and stats["processed"] % max(1, CROP_EVERY) == 0:
+                        crop_pass(self.vision, frame, track, ignored)
+                emit(finished)
+
+                stats["processed"] += 1
+                done = time.monotonic()
+                elapsed = done - started
+                # Real throughput: time between finished frames, waits included.
+                rate = 1.0 / max(done - (last_done or started), 1e-6)
+                last_done = done
+                fps = rate if stats["processed"] == 1 else 0.9 * fps + 0.1 * rate
+                stats["fps"], stats["vehicles"] = fps, len(tracker.tracks)
+
+                if self.on_frame and self.on_frame(frame, active, dict(stats)):
+                    break
+                min_interval = 1.0 / MAX_FPS if MAX_FPS > 0 else 0.0
+                if min_interval > elapsed:
+                    stop.wait(min_interval - elapsed)
+        finally:
+            emit(tracker.flush())
+            events.close()
+            reader.close()
+
+
 def main(argv=None):
     args = parse_args(argv)
     from cactus import Mirage
 
     print("loading Mirage (the first run downloads the engine and weights) ...")
     vision = Mirage(weights=args.weights)
-    print(f"opening {redact(SOURCE)}")
-    reader = LatestFrameReader(SOURCE)
-    tracker, log = Tracker(), EventLog(OUTPUT_DIR)
-    print(f"logging to {log.path.resolve()}")
+    window = {"ok": SHOW_WINDOW}
 
-    seq, processed, fps, window_ok = 0, 0, 0.0, SHOW_WINDOW
-    min_interval = 1.0 / MAX_FPS if MAX_FPS > 0 else 0.0
+    def show(frame, active, stats):
+        if window["ok"]:
+            try:
+                cv2.imshow("Traffic monitor (Q to quit)", draw(frame.copy(), active, stats["fps"]))
+                return cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27)
+            except cv2.error:
+                print("no display available; continuing without the preview window")
+                window["ok"] = False
+        elif stats["processed"] % 50 == 0:
+            print(f"{stats['processed']} frames, {stats['fps']:.1f} fps, {stats['vehicles']} vehicles in view")
+        return False
+
     try:
-        while True:
-            started = time.monotonic()
-            seq, frame = reader.read(seq)
-            if frame is None:
-                if reader.is_live:
-                    continue  # reconnecting; keep waiting
-                print("end of video")
-                break
-            height, width = frame.shape[:2]
-            rgb = np.ascontiguousarray(frame[:, :, ::-1])  # OpenCV gives BGR
-            result = vision.describe(rgb, **mirage_options(["objects", "text"]))
-            if DUMP_JSON and processed < DUMP_JSON_FRAMES:
-                print(json.dumps(result, ensure_ascii=False, indent=2)[:6000])
-
-            vehicles, plate_boxes, ignored = split_objects(parse_objects(result, width, height))
-            now = time.time()
-            active, finished = tracker.update(vehicles, width, height, now)
-            assign_plates(active, plate_boxes)
-            assign_text(active, parse_text(result, width, height), ignored)
-
-            for track in active:
-                size = area(track.box)
-                if SAVE_SNAPSHOTS and size > track.best_area:
-                    track.best_area, track.best_snapshot = size, crop(frame, track.box, CROP_PAD).copy()
-                if CROP_PASS and not track.plate_confirmed and processed % max(1, CROP_EVERY) == 0:
-                    crop_pass(vision, frame, track, ignored)
-
-            for track in finished:
-                log.write(track)
-
-            processed += 1
-            elapsed = time.monotonic() - started
-            fps = 0.9 * fps + 0.1 * (1.0 / max(elapsed, 1e-6)) if processed > 1 else 1.0 / max(elapsed, 1e-6)
-
-            if window_ok:
-                try:
-                    cv2.imshow("Traffic monitor (Q to quit)", draw(frame.copy(), active, fps))
-                    if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27):
-                        break
-                except cv2.error:
-                    print("no display available; continuing without the preview window")
-                    window_ok = False
-            elif processed % 50 == 0:
-                print(f"{processed} frames, {fps:.1f} fps, {len(tracker.tracks)} vehicles in view")
-
-            if min_interval > elapsed:
-                time.sleep(min_interval - elapsed)
+        Monitor(vision, SOURCE, OUTPUT_DIR, on_frame=show).run()
+    except SourceError as exc:
+        raise SystemExit(str(exc))
     except KeyboardInterrupt:
         print("stopping")
     finally:
-        for track in tracker.flush():
-            log.write(track)
-        log.close()
-        reader.close()
-        if window_ok:
+        if window["ok"]:
             cv2.destroyAllWindows()
 
 

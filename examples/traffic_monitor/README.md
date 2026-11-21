@@ -5,9 +5,12 @@ and decides whether each vehicle is **coming** towards the camera or **going**
 away. Every vehicle that leaves the picture becomes one row in
 `traffic_output/events.csv`, with a snapshot in `traffic_output/snapshots/`.
 
+![Traffic monitor window](traffic_gui.png)
+
 | File | What it is |
 | --- | --- |
-| `traffic_monitor.py` | The program. Settings are at the top of the file. |
+| `traffic_gui.py` | The window: live video, settings you can change while it runs, and the list of vehicles. **Start here.** |
+| `traffic_monitor.py` | The engine. It also runs on its own from the command line, with settings at the top of the file. |
 | `test_traffic_monitor.py` | Offline tests with a fake Mirage and a synthetic video. |
 | `TrafficMonitor.sln`, `TrafficMonitor.pyproj` | Visual Studio solution and Python project. |
 | `requirements.txt` | `cactus-compute`, `opencv-python`, `numpy`. |
@@ -28,25 +31,41 @@ away. Every vehicle that leaves the picture becomes one row in
    **Install packages from file** points to `requirements.txt`, and click
    **Create**. Visual Studio installs everything and makes it the project's
    environment.
-4. **Point it at your camera.** Open `traffic_monitor.py` and edit the
-   settings block at the top. The main ones are listed under
-   [Settings](#settings) below.
-5. **Run it.** Press **F5** (**Debug > Start Debugging**) or **Ctrl+F5**
-   (**Debug > Start Without Debugging**, which runs faster). A console window
-   shows the log and a preview window shows the boxes. Press **Q** or **Esc**
-   in the preview window to stop.
+4. **Run it.** Press **F5**, or **Ctrl+F5** to run faster without the
+   debugger. The Traffic Monitor window opens.
 
-The first run downloads the Cactus engine (a Windows x86-64 or ARM64 build
+The first Start downloads the Cactus engine (a Windows x86-64 or ARM64 build
 is published) and the Mirage weights from Hugging Face, then caches them.
 
-**Arguments without the command line:** **Project > TrafficMonitor
-Properties > Debug > Script Arguments** takes the same options as the
-command line, for example
-`--source rtsp://user:pass@192.168.1.64/stream --approach up --dump-json`.
+## Using the window
+
+* **Camera / video** at the top: an RTSP address such as
+  `rtsp://127.0.0.1:8554/Streaming/Channels/101`, or **Browse...** for a
+  recorded video, which is the easiest way to tune. Press **Start**.
+* **Settings tabs** on the right: **Direction**, **Plates**, **Reading**,
+  **Detection** and **Output**. A change takes effect on the next frame, so
+  you can watch its effect on the video. Point at a setting to see what it
+  does at the bottom of the panel. A value that is not allowed shows a red
+  warning and the old value stays in use. Settings marked `*` (output folder,
+  weights file) apply at the next Start.
+* **Plates > Country** fills in the plate layouts for the UK or Turkey. Other
+  layouts can be typed, with `A` for a letter and `9` for a digit.
+* **Vehicles** at the bottom lists each vehicle when it leaves the picture:
+  green for coming, orange for going. Double-click a row to open its
+  snapshot. **Log** shows status messages and, if switched on under
+  **Output**, Mirage's raw output.
+* Settings are saved to `traffic_settings.json` when you press Start and when
+  you close the window. **Reset all settings to defaults** undoes everything.
+  That file can contain your camera password, so it is kept out of git.
 
 **Running the tests from menus:** **Test > Test Explorer**. If Visual
 Studio asks, pick **pytest** as the framework and the project folder as the
 root, then click **Run All**.
+
+**Without the window:** right-click `traffic_monitor.py` in Solution
+Explorer > **Set as Startup File**. It then uses the settings at the top of
+that file, or the options in **Project > Properties > Debug > Script
+Arguments**, for example `--approach up --plate-format AA99AAA --dump-json`.
 
 **Using your clone's Cactus code instead of PyPI:** right-click **Search
 Paths** in Solution Explorer > **Add Folder to Search Path...** and choose the
@@ -54,6 +73,8 @@ root folder of the clone. Also install the clone's `requirements.txt`
 (`huggingface_hub`, `Pillow`) into the environment.
 
 ## Settings
+
+The window shows all of these. Their names in `traffic_monitor.py`:
 
 | Setting | Meaning |
 | --- | --- |
@@ -72,7 +93,7 @@ root folder of the clone. Also install the clone's `requirements.txt`
 
 ## First run checklist
 
-1. **Turn on `DUMP_JSON`** (or pass `--dump-json`) to see Mirage's raw output.
+1. **Turn on Output > Show Mirage's raw output** (`DUMP_JSON`) if detections look wrong.
    Checked on a real camera: objects come as `{"id", "name", "bbox"}`,
    text lines as `{"string", "bbox"}`, and boxes are `x0, y0, x1, y1` on a
    0-1000 grid. The parser already handles that.
@@ -88,11 +109,12 @@ root folder of the clone. Also install the clone's `requirements.txt`
   direction and getting bigger means *coming*. The reverse means *going*.
   Too little movement gives *unknown*. One frame can't tell motion, so
   this needs at least two frames of the same vehicle.
-* **Plates** come from text Mirage reads inside a vehicle's box, plus a
-  second read of a full-resolution crop, because Mirage shrinks its input
-  and plates are small. Each read is cleaned, checked against
-  `PLATE_REGEX`, gets one common OCR fix tried (O/0, I/1, S/5, B/8, Z/2,
-  G/6), and votes. The most-voted plate wins.
+* **Plates** come from text Mirage reads inside a vehicle's box (double
+  votes inside its "license plate" box), plus a second read of a
+  full-resolution crop of the plate, because Mirage shrinks its input and
+  plates are small. Each read is cleaned, fitted to the plate layouts
+  (O/0, I/1, L/1, S/5, B/8, Z/2, G/6 are fixed by position) or checked
+  against `PLATE_REGEX`, and votes. The most-voted plate wins.
 
 Mirage is a general vision model, not a dedicated plate reader. Test it on
 recordings from your own camera before relying on it, especially at night,

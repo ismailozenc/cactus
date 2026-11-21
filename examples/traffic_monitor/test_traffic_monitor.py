@@ -52,7 +52,7 @@ def test_plate_cleaning_and_ocr_fixes(monkeypatch):
     assert tm.plate_candidates("34 abc-123") == ["34ABC123"]
     assert tm.plate_candidates("STOP") == []            # no digit, never "5TOP"
     assert tm.plate_candidates("SPEED LIMIT 50") == []  # too long
-    monkeypatch.setattr(tm, "_plate_re", tm.re.compile(r"^[0-9]{2}[A-Z]{1,3}[0-9]{2,4}$"))
+    monkeypatch.setattr(tm, "PLATE_REGEX", r"^[0-9]{2}[A-Z]{1,3}[0-9]{2,4}$")
     assert tm.plate_candidates("34 ABC I23") == ["34ABC123"]  # I read as 1
 
 
@@ -201,3 +201,42 @@ def test_plate_format_argument(monkeypatch):
     assert tm.PLATE_FORMATS == ("AA99AAA",)
     with pytest.raises(SystemExit):
         tm.parse_args(["--plate-format", "AA-99"])
+
+
+def test_gui_settings_parsing():
+    pytest.importorskip("tkinter")
+    pytest.importorskip("PIL.ImageTk")
+    import traffic_gui as gui
+    assert gui.parse_value("int", (1, 10), " 4 ") == 4
+    assert gui.parse_value("optfloat", (0, 1, 0.1), "") is None
+    assert gui.parse_value("layouts", None, "aa99aaa, 99A9999") == ("AA99AAA", "99A9999")
+    assert gui.parse_value("list", None, "car, , truck") == ("car", "truck")
+    for kind, extra, text in [("int", (1, 10), "11"), ("int", (1, 10), "x"), ("float", (0, 1, 0.1), "2"),
+                              ("layouts", None, "AA-99"), ("choice", ("up", "down"), "left")]:
+        with pytest.raises(ValueError):
+            gui.parse_value(kind, extra, text)
+    with pytest.raises(Exception):
+        gui.parse_value("regex", None, "([")
+    # Every control's current value survives a round trip through its text.
+    for name, kind, _, _, extra in gui.all_specs():
+        if kind != "bool":
+            value = getattr(tm, name)
+            assert gui.parse_value(kind, extra, gui.to_text(kind, value)) == value, name
+
+
+def test_gui_settings_file_round_trip(tmp_path, monkeypatch):
+    pytest.importorskip("tkinter")
+    pytest.importorskip("PIL.ImageTk")
+    import traffic_gui as gui
+    monkeypatch.setattr(gui, "SETTINGS_FILE", tmp_path / "s.json")
+    for name, value in {"APPROACH": "up", "PLATE_FORMATS": ("AA99AAA",), "CROP_PASS": False,
+                        "OBJECT_CONF": 0.4, "SOURCE": "rtsp://x"}.items():
+        monkeypatch.setattr(tm, name, value)
+    gui.save_settings()
+    for name in ("APPROACH", "PLATE_FORMATS", "CROP_PASS", "OBJECT_CONF", "SOURCE"):
+        monkeypatch.setattr(tm, name, gui.DEFAULTS[name])
+    (tmp_path / "s.json").write_text((tmp_path / "s.json").read_text().replace('"MAX_FPS": 10.0', '"MAX_FPS": "bad"'))
+    gui.load_settings()
+    assert (tm.APPROACH, tm.PLATE_FORMATS, tm.CROP_PASS, tm.OBJECT_CONF, tm.SOURCE) == \
+        ("up", ("AA99AAA",), False, 0.4, "rtsp://x")
+    assert tm.MAX_FPS == gui.DEFAULTS["MAX_FPS"]   # a bad saved value is ignored
