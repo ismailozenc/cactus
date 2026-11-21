@@ -48,6 +48,11 @@ is published) and the Mirage weights from Hugging Face, then caches them.
   does at the bottom of the panel. A value that is not allowed shows a red
   warning and the old value stays in use. Settings marked `*` (output folder,
   weights file) apply at the next Start.
+* **Plates > Read number plates** is **off** by default: Mirage is then asked
+  for objects only (no text) and there is no second plate read, so every pass
+  is as short as possible and the program tracks moving vehicles and their
+  direction only. Tick it to read plates as described below; nothing about
+  plate reading has been removed. Command line: `--plates`.
 * **Plates > Country** sets the plate format: **Germany** (the default), the
   UK or Turkey. German plates are matched with a pattern: district (1-3
   letters, Ä Ö Ü allowed), 1-2 letters, 1-4 digits, then E or H optionally,

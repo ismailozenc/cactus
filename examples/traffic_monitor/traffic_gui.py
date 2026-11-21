@@ -73,6 +73,9 @@ SETTINGS = {
          "Mirage reads is logged and forgotten after this long.", (0.2, 600, 0.5)),
     ],
     "Plates": [
+        ("READ_PLATES", "bool", "Read number plates", "Off (default): Mirage only looks for vehicles, which keeps "
+         "each pass short; plates are not read and the settings below are kept but unused. On: plates are read "
+         "and voted on as before.", None),
         ("_PRESET", "preset", "Country", "Sets the plate format for a country. Germany uses the regex "
          "(district, letters, digits, E/H for electric or historic).", None),
         ("PLATE_FORMATS", "layouts", "Plate layouts", "A = letter, 9 = digit, comma separated, e.g. AA99AAA. Reads are "

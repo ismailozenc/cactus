@@ -80,6 +80,11 @@ VEHICLE_PART_WORDS = ("plate", "wheel", "tire", "tyre", "door", "window", "mirro
 DUPLICATE_OVERLAP = 0.8        # share of the smaller box inside the bigger one
 DUPLICATE_SIZE_RATIO = 0.4     # smaller/bigger area; tinier boxes are cars behind
 
+# Number plates. Off: Mirage is asked for objects only (no text), there is no
+# second plate read, and only vehicles and their directions are tracked,
+# which keeps every pass as short as possible. On: everything below applies.
+READ_PLATES = False
+
 # Mirage also detects number plates as objects. Their boxes are preferred for
 # reading: text inside one gets PLATE_BOX_VOTES votes instead of 1, and the
 # crop pass reads the plate box instead of the whole vehicle.
@@ -253,6 +258,11 @@ class LatestFrameReader:
                 return last_seq, None
             time.sleep(0.005)
         return last_seq, None
+
+    @property
+    def ended(self) -> bool:
+        """True once a video file has been read to the end (never for a live stream)."""
+        return self._ended.is_set()
 
     def close(self):
         self._stop.set()
@@ -888,10 +898,12 @@ def draw_mirage_view(view: MirageView):
             cv2.putText(image, text[:24], (box[0], min(image.shape[0] - 3, box[3] + 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
     h, w = image.shape[:2]
+    if w < 560:   # pad a small crop so the caption fits
+        image = np.hstack([image, np.full((h, 560 - w, 3), 30, np.uint8)])
     what = "whole frame" if view.whole_frame else f"crop {w}x{h} at {view.offset[0]},{view.offset[1]}"
     caption = (f"pass {view.number}: {what}, {view.seconds:.1f} s, {len(view.objects)} objects, "
                f"{len(view.lines)} text")
-    bar = np.full((26, w, 3), 30, np.uint8)
+    bar = np.full((26, image.shape[1], 3), 30, np.uint8)
     cv2.putText(bar, caption, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     return np.vstack([bar, image])
 
@@ -990,10 +1002,10 @@ def draw(frame, tracks, fps: float, motion: Motion = None, now: float = None, st
         if t.plate_box is not None and parked:
             p = t.plate_box
             cv2.rectangle(frame, (p[0], p[1]), (p[2], p[3]), (255, 255, 0), 1)
-        plate = t.plate or "?"
-        if t.plate and not t.plate_confirmed:
-            plate += "?"
-        text = f"#{t.id} {t.label} {direction} {plate}"
+        plate = ""
+        if READ_PLATES:
+            plate = " " + (t.plate or "?") + ("?" if t.plate and not t.plate_confirmed else "")
+        text = f"#{t.id} {t.label} {direction}{plate}"
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(frame, (x0, max(0, y0 - th - 8)), (x0 + tw + 6, y0), colour, -1)
         cv2.putText(frame, text, (x0 + 3, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
@@ -1092,7 +1104,7 @@ def crop_pass(vision, frame, track):
 
 def parse_args(argv=None):
     global SOURCE, APPROACH, DUMP_JSON, BBOX_ORDER, SHOW_WINDOW, MAX_FPS, OUTPUT_DIR, PLATE_REGEX
-    global PLATE_FORMATS
+    global PLATE_FORMATS, READ_PLATES
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--source", default=SOURCE, help="RTSP URL, video file or webcam number")
     p.add_argument("--approach", default=APPROACH, choices=["down", "up", "left", "right"],
@@ -1100,6 +1112,8 @@ def parse_args(argv=None):
     p.add_argument("--dump-json", action="store_true", default=DUMP_JSON,
                    help="print Mirage's raw JSON for the first frames")
     p.add_argument("--bbox-order", default=BBOX_ORDER, choices=["xyxy", "yxyx"])
+    p.add_argument("--plates", action="store_true", default=READ_PLATES,
+                   help="also read number plates (slower; off by default)")
     p.add_argument("--plate-regex", default=PLATE_REGEX)
     p.add_argument("--plate-format", action="append", default=None, metavar="LAYOUT",
                    help="plate layout such as AA99AAA (A = letter, 9 = digit); repeat for several")
@@ -1111,6 +1125,7 @@ def parse_args(argv=None):
     SOURCE, APPROACH, DUMP_JSON = args.source, args.approach, args.dump_json
     BBOX_ORDER, MAX_FPS, OUTPUT_DIR = args.bbox_order, args.max_fps, args.output
     SHOW_WINDOW = SHOW_WINDOW and not args.no_window
+    READ_PLATES = args.plates
     try:
         re.compile(args.plate_regex)
     except re.error as exc:
@@ -1189,7 +1204,8 @@ class Monitor:
         region = motion.region if motion.action == "crop" else None
         image, (x0, y0), keep = mirage_input(frame, motion)
         rgb = np.ascontiguousarray(image[:, :, ::-1])  # OpenCV gives BGR
-        result = self.vision.describe(rgb, **mirage_options(["objects", "text"]))
+        # Without plates, skip text: Mirage then only writes out objects, which is quicker.
+        result = self.vision.describe(rgb, **mirage_options(["objects", "text"] if READ_PLATES else ["objects"]))
         first_read = time.monotonic() - started
         stats["mirage_frames"] += 1
         if DUMP_JSON and stats["mirage_frames"] <= DUMP_JSON_FRAMES:
@@ -1221,8 +1237,9 @@ class Monitor:
                 recent = [t.box for t in self.tracker.tracks.values() if now - t.last_seen <= limit]
                 empty = [b for b in motion.boxes if not any(area(overlap(b, r)) > 0 for r in recent)]
                 self.gate.absorb(empty, MOTION_FORGET_EMPTY)
-            assign_plates(active, plate_boxes)
-            assign_text(active, lines, ignored)
+            if READ_PLATES:
+                assign_plates(active, plate_boxes)
+                assign_text(active, lines, ignored)
             for track in active:
                 size = area(track.box)
                 if SAVE_SNAPSHOTS and size > track.best_area:
@@ -1230,7 +1247,7 @@ class Monitor:
             # One second read per Mirage pass at most, to the vehicle that waited longest.
             wanting = [t for t in active if not t.plate_confirmed and not t.is_parked(now)]
             chosen = None
-            if CROP_PASS and wanting and stats["mirage_frames"] % max(1, CROP_EVERY) == 0:
+            if READ_PLATES and CROP_PASS and wanting and stats["mirage_frames"] % max(1, CROP_EVERY) == 0:
                 chosen = min(wanting, key=lambda t: t.last_crop)
                 chosen.last_crop = now
             self._emit(finished)
@@ -1321,8 +1338,10 @@ class Monitor:
                 started = time.monotonic()
                 seq, frame = reader.read(seq, timeout=0.5)
                 if frame is None:
-                    if reader.is_live:
-                        continue  # waiting or reconnecting
+                    # A stream may be waiting or reconnecting, and a file may just be slow to
+                    # decode; only a file that has really been read to the end stops here.
+                    if reader.is_live or not getattr(reader, "ended", True):
+                        continue
                     self.log("end of video")
                     break
                 height, width = frame.shape[:2]

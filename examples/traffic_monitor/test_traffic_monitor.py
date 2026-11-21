@@ -25,6 +25,7 @@ def defaults(monkeypatch):
     monkeypatch.setattr(tm, "BBOX_ORDER", "xyxy")
     monkeypatch.setattr(tm, "SHOW_WINDOW", False)
     monkeypatch.setattr(tm, "PLATE_REGEX", tm.ANY_PLATE_REGEX)   # tests below use "34 ABC 123"
+    monkeypatch.setattr(tm, "READ_PLATES", True)                  # most tests below check plates too
 
 
 def test_boxes_scale_order_and_clamp(monkeypatch):
@@ -645,3 +646,61 @@ def test_a_big_still_object_does_not_capture_a_car_nearby():
     tracker.update([("car", None, (510, 430, 891, 539))], 960, 540, 0.0)    # big white thing, wrongly "car"
     tracker.update([("car", None, (200, 134, 341, 225))], 960, 540, 1.0)    # a real car, 1.4 big-boxes away
     assert sorted(tracker.tracks) == [1, 2]
+
+
+def test_without_plates_mirage_is_asked_for_objects_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(tm, "READ_PLATES", False)
+    video = tmp_path / "street.avi"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (640, 360))
+    for i in range(40):
+        y = 20 + 7 * i
+        writer.write(street([(80, y, 180, y + 60)]))
+    writer.release()
+    monkeypatch.setitem(sys.modules, "cactus", types.SimpleNamespace(Mirage=CountingMirage))
+    out = tmp_path / "out"
+    tm.main(["--source", str(video), "--no-window", "--output", str(out), "--max-fps", "0"])
+    calls = CountingMirage.calls
+    assert calls and all(sections == ("objects",) for _, _, sections in calls)   # no text, no plate reads
+    rows = list(csv.DictReader(open(out / "events.csv", encoding="utf-8")))
+    assert [(r["direction"], r["plate"]) for r in rows] == [("coming", "")]
+
+
+def test_plates_default_off_and_switch():
+    import importlib
+    fresh = importlib.reload(tm)
+    assert fresh.READ_PLATES is False
+    fresh.parse_args(["--plates", "--no-window"])
+    assert fresh.READ_PLATES is True
+
+
+def test_a_slow_video_file_is_not_mistaken_for_its_end(tmp_path, monkeypatch):
+    """Decoding pauses longer than the read timeout must not end a recording early."""
+    class SlowFile:
+        def __init__(self, source, log=None):
+            self.is_live, self.n, self.ended = False, 0, False
+
+        def read(self, last_seq, timeout=0.5):
+            self.n += 1
+            if self.n % 3 == 0:
+                return last_seq, None          # timed out: decoder busy, not the end
+            if self.n > 90:
+                self.ended = True
+                return last_seq, None
+            y = 20 + 4 * self.n
+            return self.n, street([(80, y, 180, y + 60)])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tm, "LatestFrameReader", SlowFile)
+    monkeypatch.setattr(tm, "MAX_FPS", 0)
+    monkeypatch.setattr(tm, "READ_PLATES", False)
+    seen = []
+    tm.Monitor(CountingMirage(), "clip.avi", str(tmp_path), on_frame=lambda f, v, s, m: seen.append(1) and False,
+               log=lambda m: None).run()
+    assert len(seen) == 60                      # every real frame, not just those before the first pause
+
+
+def test_mirage_view_of_a_small_crop_is_padded_for_the_caption():
+    view = tm.MirageView(1, street(size=(160, 280)), (0, 0), [], [], 0.5, False)
+    assert tm.draw_mirage_view(view).shape[1] == 560
